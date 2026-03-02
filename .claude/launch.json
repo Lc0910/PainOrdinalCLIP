@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tensorboard",
+      "runtimeExecutable": "tensorboard",
+      "runtimeArgs": ["--logdir", "results", "--port", "6006", "--bind_all"],
+      "port": 6006
+    },
+    {
+      "name": "jupyter-notebook",
+      "runtimeExecutable": "jupyter",
+      "runtimeArgs": ["notebook", "--port", "8888", "--no-browser", "--ip", "0.0.0.0"],
+      "port": 8888
+    }
+  ]
+}

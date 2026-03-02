@@ -124,3 +124,6 @@ src/
 tmp/
 /results
 /configs/sweep_cfgs
+
+# Cache
+.cache/

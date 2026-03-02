@@ -1,0 +1,11 @@
+data_cfg:
+  train_images_root: data/biovid
+  val_images_root: data/biovid
+  test_images_root: data/biovid
+  train_data_file: data/biovid/train.txt
+  val_data_file: data/biovid/test.txt
+  test_data_file: data/biovid/test.txt
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      num_ranks: 5

@@ -101,7 +101,7 @@ class RegressionDataset(Dataset):
         if self.transforms:
             img = self.transforms(img)
 
-        return img, target
+        return img, target, img_file
 
     def generate_long_tail(self):
         images_file_new, labels_new = [], []
