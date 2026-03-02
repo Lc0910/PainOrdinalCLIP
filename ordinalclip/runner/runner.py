@@ -1,7 +1,8 @@
+import csv
 import json
 from collections import defaultdict
 from multiprocessing.sharedctypes import Value
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytorch_lightning as pl
 import torch
@@ -57,8 +58,8 @@ class Runner(pl.LightningModule):
 
     # Running Steps
     def run_step(self, batch, batch_idx):
-        x, y = batch
-        logits, *_ = self.module(x)
+        x, y = batch[0], batch[1]  # [B, 3, H, W], [B]
+        logits, *_ = self.module(x)  # logits: [B, num_ranks]
 
         losses = self.compute_losses(logits, y)
         loss = sum([weight * losses[k] for k, weight in self.loss_weights.items()])
@@ -75,23 +76,28 @@ class Runner(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         outputs = self.run_step(batch, batch_idx)
-
+        if len(batch) > 2:
+            outputs["_paths"] = batch[2]
+            outputs["_targets"] = batch[1]
         return outputs
 
     def test_step(self, batch, batch_idx):
         outputs = self.run_step(batch, batch_idx)
-
+        if len(batch) > 2:
+            outputs["_paths"] = batch[2]
+            outputs["_targets"] = batch[1]
         return outputs
 
     # Epoch Eval
     def eval_epoch_end(self, outputs, run_type):
-        """_summary_
+        """Frame-level stats + video-level aggregation.
 
         Args:
-            outputs (_type_): _description_
-            run_type (_type_): _description_
+            outputs: list of dicts from val/test steps
+            run_type: "val" or "test"
             moniter_key: "{val/test}_epoch_{mae/acc}_{exp/max}_metric"
         """
+        # --- Frame-level stats (original logic) ---
         stats = defaultdict(list)
         for _outputs in outputs:
             for k, v in _outputs.items():
@@ -109,6 +115,101 @@ class Runner(pl.LightningModule):
         stats["ckpt_path"] = str(self.ckpt_path)
         with open(str(self.output_dir / f"{run_type}_stats.json"), "a") as f:
             f.write(json.dumps(stats) + "\n")
+
+        # --- Video-level aggregation ---
+        self._video_level_aggregation(outputs, run_type)
+
+    def _video_level_aggregation(self, outputs, run_type):
+        """Aggregate frame predictions to video-level results.
+
+        video_id is derived by stripping the trailing frame index:
+        e.g. "images/071309_w_21-BL1-081_27.jpg" -> video_id "071309_w_21-BL1-081"
+        """
+        all_paths = []
+        all_targets = []
+        all_pred_exp = []
+        all_pred_max = []
+        for _outputs in outputs:
+            if "_paths" not in _outputs:
+                return  # paths not available, skip video aggregation
+            all_paths.extend(_outputs["_paths"])
+            all_targets.append(_outputs["_targets"].detach().cpu().float())
+            all_pred_exp.append(_outputs["predict_y_exp"].detach().cpu().float())
+            all_pred_max.append(_outputs["predict_y_max"].detach().cpu().float())
+
+        if not all_paths:
+            return
+
+        all_targets = torch.cat(all_targets)  # [N]
+        all_pred_exp = torch.cat(all_pred_exp)  # [N]
+        all_pred_max = torch.cat(all_pred_max)  # [N]
+
+        # Parse video_id from path: remove extension, split by last "_" to drop frame index
+        video_groups = defaultdict(lambda: {"targets": [], "pred_exp": [], "pred_max": []})
+        for i, path in enumerate(all_paths):
+            stem = PurePosixPath(path).stem  # e.g. "071309_w_21-BL1-081_27"
+            video_id = stem.rsplit("_", 1)[0]  # e.g. "071309_w_21-BL1-081"
+            video_groups[video_id]["targets"].append(all_targets[i].item())
+            video_groups[video_id]["pred_exp"].append(all_pred_exp[i].item())
+            video_groups[video_id]["pred_max"].append(all_pred_max[i].item())
+
+        # Compute video-level metrics
+        video_mae_exp, video_mae_max = [], []
+        video_acc_exp, video_acc_max = [], []
+        video_predictions = []
+
+        for vid, data in video_groups.items():
+            targets_sorted = sorted(data["targets"])
+            gt = targets_sorted[len(targets_sorted) // 2]  # median gt
+            pred_exp = sum(data["pred_exp"]) / len(data["pred_exp"])  # mean pred
+            pred_max = sum(data["pred_max"]) / len(data["pred_max"])  # mean pred
+
+            video_mae_exp.append(abs(pred_exp - gt))
+            video_mae_max.append(abs(pred_max - gt))
+            video_acc_exp.append(1.0 if round(pred_exp) == gt else 0.0)
+            video_acc_max.append(1.0 if round(pred_max) == gt else 0.0)
+
+            video_predictions.append({
+                "video_id": vid,
+                "gt": int(gt),
+                "pred_exp": round(pred_exp, 4),
+                "pred_max": round(pred_max, 4),
+                "n_frames": len(data["targets"]),
+            })
+
+        n_videos = len(video_groups)
+        video_stats = {
+            "mae_exp_metric": sum(video_mae_exp) / n_videos,
+            "mae_max_metric": sum(video_mae_max) / n_videos,
+            "acc_exp_metric": sum(video_acc_exp) / n_videos,
+            "acc_max_metric": sum(video_acc_max) / n_videos,
+            "num_videos": n_videos,
+            "epoch": self.current_epoch,
+            "output_dir": str(self.output_dir),
+            "ckpt_path": str(self.ckpt_path),
+        }
+        with open(str(self.output_dir / f"{run_type}_video_stats.json"), "a") as f:
+            f.write(json.dumps(video_stats) + "\n")
+
+        # Write per-video predictions CSV.
+        # Append instead of overwrite to preserve history across epochs/ckpts.
+        csv_path = self.output_dir / f"{run_type}_video_predictions.csv"
+        csv_exists = csv_path.exists()
+        with open(str(csv_path), "a", newline="") as f:
+            fieldnames = ["epoch", "ckpt_path", "video_id", "gt", "pred_exp", "pred_max", "n_frames"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not csv_exists:
+                writer.writeheader()
+            for row in video_predictions:
+                row["epoch"] = self.current_epoch
+                row["ckpt_path"] = str(self.ckpt_path)
+            writer.writerows(video_predictions)
+
+        logger.info(
+            f"[{run_type}] video-level: {n_videos} videos, "
+            f"mae_exp={video_stats['mae_exp_metric']:.4f}, mae_max={video_stats['mae_max_metric']:.4f}, "
+            f"acc_exp={video_stats['acc_exp_metric']:.4f}, acc_max={video_stats['acc_max_metric']:.4f}"
+        )
 
     def validation_epoch_end(self, outputs) -> None:
         self.eval_epoch_end(outputs, "val")
@@ -173,7 +274,7 @@ class Runner(pl.LightningModule):
         mae = torch.abs(predict_y - y)
         acc = (torch.round(predict_y) == y).type(logits.dtype)
 
-        return {f"mae_{gather_type}_metric": mae, f"acc_{gather_type}_metric": acc, "predict_y": predict_y}
+        return {f"mae_{gather_type}_metric": mae, f"acc_{gather_type}_metric": acc, f"predict_y_{gather_type}": predict_y}
 
     # Optimizer & Scheduler
     def configure_optimizers(self):
