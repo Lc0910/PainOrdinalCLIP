@@ -390,6 +390,31 @@ class Runner(pl.LightningModule):
             except AttributeError:
                 pass
 
+        # Baseline uses last_project (nn.Linear) instead of prompt_learner.rank_embeds.
+        # Without this block, last_project is NEVER added to any optimizer param group,
+        # causing the linear head to stay randomly initialized for the entire training.
+        # We reuse lr_prompt_learner_ranks as the learning rate for the linear head.
+        if (
+            self.module.prompt_learner is None
+            and hasattr(self.module, "last_project")
+            and self.module.last_project is not None
+        ):
+            if lr_prompt_learner_ranks > 0:
+                self._custom_logger.info(
+                    f"Baseline: train last_project (linear head) with lr={lr_prompt_learner_ranks}"
+                )
+                param_dict_ls.append(
+                    {
+                        "params": self.module.last_project.parameters(),
+                        "lr": lr_prompt_learner_ranks,
+                        "init_lr": lr_prompt_learner_ranks,
+                        "name": "lr_last_project",
+                    }
+                )
+            else:
+                self._custom_logger.info("Baseline: freeze_param(self.module.last_project)")
+                freeze_param(self.module.last_project)
+
         if lr_image_encoder > 0 and self.module.image_encoder is not None:
             if staged_lr_image_encoder is not None:
                 self._custom_logger.info("staged_lr_image_encoder activated")
