@@ -7,7 +7,8 @@
 #
 # Usage:
 #   bash scripts/experiments/run_biovid_matrix.sh
-#   bash scripts/experiments/run_biovid_matrix.sh --test_only
+#   bash scripts/experiments/run_biovid_matrix.sh --max_epochs 50
+#   bash scripts/experiments/run_biovid_matrix.sh --test_only --max_epochs 50
 #
 # Output per experiment:
 #   results/biovid-{model}-{backbone}/version_N/
@@ -22,9 +23,29 @@ DEFAULT_CFG="configs/default.yaml"
 BIOVID_CFG="configs/base_cfgs/data_cfg/datasets/biovid/biovid.yaml"
 
 TEST_ONLY_FLAG=""
-if [[ "${1:-}" == "--test_only" ]]; then
-    TEST_ONLY_FLAG="--test_only"
-fi
+MAX_EPOCHS="100"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --test_only)
+            TEST_ONLY_FLAG="--test_only"
+            shift
+            ;;
+        --max_epochs)
+            MAX_EPOCHS="${2:-}"
+            if [[ -z "${MAX_EPOCHS}" ]]; then
+                echo "Error: --max_epochs requires a value"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Usage: bash scripts/experiments/run_biovid_matrix.sh [--test_only] [--max_epochs 50]"
+            exit 1
+            ;;
+    esac
+done
 
 run_one() {
     local model_name="$1"
@@ -42,7 +63,10 @@ run_one() {
         --config "${text_cfg}" \
         "$@" \
         --output_dir "${output_dir}" \
-        ${TEST_ONLY_FLAG}
+        ${TEST_ONLY_FLAG} \
+        --cfg_options \
+        trainer_cfg.max_epochs=${MAX_EPOCHS} \
+        runner_cfg.optimizer_and_scheduler_cfg.lr_scheduler_cfg.max_epochs=${MAX_EPOCHS}
 }
 
 for backbone in rn50 vitb16; do
