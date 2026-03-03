@@ -43,6 +43,8 @@ runner_cfg:
   loss_weights:
     ce_loss: 1.0
     kl_loss: 1.0
+  ordinal_soft_label: false
+  ordinal_soft_label_sigma: 1.0
   model_cfg:
     type: OrdinalCLIP
     prompt_learner_cfg:

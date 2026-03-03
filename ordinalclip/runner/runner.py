@@ -32,6 +32,8 @@ class Runner(pl.LightningModule):
             kl_loss=1.0,
         ),
         ckpt_path="",
+        ordinal_soft_label: bool = False,
+        ordinal_soft_label_sigma: float = 1.0,
     ) -> None:
         super().__init__()
         self.module = MODELS.build(model_cfg)
@@ -39,6 +41,8 @@ class Runner(pl.LightningModule):
         self.ce_loss_func = nn.CrossEntropyLoss()
         self.kl_loss_func = nn.KLDivLoss(reduction="sum")
         self.loss_weights = loss_weights
+        self.ordinal_soft_label = ordinal_soft_label
+        self.ordinal_soft_label_sigma = ordinal_soft_label_sigma
         self.num_ranks = self.module.num_ranks
         self.register_buffer("rank_output_value_array", torch.arange(0, self.num_ranks).float(), persistent=False)
         self.output_dir = Path(output_dir)
@@ -242,10 +246,35 @@ class Runner(pl.LightningModule):
     # Loss & Metrics
     def compute_losses(self, logits, y):
         losses = {}
-        losses["ce_loss"] = self.ce_loss_func(logits, y)
+        if self.ordinal_soft_label:
+            # Ordinal Gaussian soft label CE: Gaussian-smoothed targets centered at true rank.
+            # Better for few-class ordinal problems (e.g. 5-class pain) where adjacent ranks
+            # should carry partial credit and CE gradients should not be overly sharp.
+            soft_targets = self._make_ordinal_soft_targets(y)  # [B, num_ranks]
+            losses["ce_loss"] = -(soft_targets * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+        else:
+            losses["ce_loss"] = self.ce_loss_func(logits, y)
         losses["kl_loss"] = self.compute_kl_loss(logits, y)
 
         return losses
+
+    def _make_ordinal_soft_targets(self, y: torch.Tensor) -> torch.Tensor:
+        """Build Gaussian-smoothed ordinal soft labels for each sample.
+
+        Args:
+            y: [B] integer rank labels.
+        Returns:
+            soft_targets: [B, num_ranks] probability distribution per sample.
+        """
+        dtype = self.rank_output_value_array.dtype
+        sigma = self.ordinal_soft_label_sigma
+        # rank_range: [1, num_ranks], y_col: [B, 1]
+        rank_range = self.rank_output_value_array.unsqueeze(0)  # [1, num_ranks]
+        y_col = y.float().unsqueeze(1)  # [B, 1]
+        # Gaussian: exp(-0.5 * ((k - y) / sigma)^2) then normalize
+        gauss = torch.exp(-0.5 * ((rank_range - y_col) / sigma) ** 2)  # [B, num_ranks]
+        soft_targets = gauss / gauss.sum(dim=-1, keepdim=True)  # [B, num_ranks]
+        return soft_targets.type(dtype)
 
     def compute_kl_loss(self, logits, y):
         y_t = F.one_hot(y, self.num_ranks).t()

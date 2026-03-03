@@ -1,0 +1,6 @@
+# BioVid v4: clinical intensity style
+# Construct: "pain intensity level is [rank]"
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      init_context: "pain intensity level is"

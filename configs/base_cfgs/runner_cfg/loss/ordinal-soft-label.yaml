@@ -1,0 +1,7 @@
+# Enable Gaussian-smoothed ordinal soft label CE loss.
+# Better for few-class ordinal tasks (e.g. 5-class BioVid pain).
+# sigma=1.0: adjacent rank gets ~0.61 of center weight (soft boundary)
+# sigma=0.5: sharper, similar to hard label; sigma=2.0: very smooth
+runner_cfg:
+  ordinal_soft_label: true
+  ordinal_soft_label_sigma: 1.0
