@@ -28,6 +28,8 @@ class Baseline(nn.Module):
             image_encoder_name,
             root=osp.join(osp.dirname(osp.realpath(__file__)), "..", "..", ".cache", "clip"),
         )
+        # Keep trainable params in fp32 so Lightning native AMP can unscale grads safely.
+        clip_model.float()
         self.image_encoder = clip_model.visual
         self.text_encoder = None
         self.prompt_learner = None
