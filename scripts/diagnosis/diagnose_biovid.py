@@ -12,6 +12,7 @@ Usage:
     python scripts/diagnosis/diagnose_biovid.py -d results/biovid-coop-frozen-rn50
     python scripts/diagnosis/diagnose_biovid.py -d results/  # all sub-dirs
 """
+from __future__ import annotations  # Python 3.8 compatible PEP585 generics
 
 import argparse
 import json
@@ -31,22 +32,32 @@ def load_video_predictions(csv_path: Path) -> list[dict]:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append({
-                "epoch": int(row["epoch"]),
-                "video_id": row["video_id"],
-                "gt": int(row["gt"]),
-                "pred_exp": float(row["pred_exp"]),
-                "pred_max": float(row["pred_max"]),
-                "n_frames": int(row["n_frames"]),
+                "epoch":     int(row["epoch"]),
+                "ckpt_path": row.get("ckpt_path", ""),   # empty string if column absent
+                "video_id":  row["video_id"],
+                "gt":        int(row["gt"]),
+                "pred_exp":  float(row["pred_exp"]),
+                "pred_max":  float(row["pred_max"]),
+                "n_frames":  int(row["n_frames"]),
             })
     return rows
 
 
 def last_epoch_rows(rows: list[dict]) -> list[dict]:
-    """Keep only rows from the last epoch (assumes CSV appended per epoch)."""
+    """Keep only rows from the last (epoch, ckpt_path) checkpoint.
+
+    Filtering on epoch alone is insufficient when multiple checkpoints
+    are evaluated at the same epoch number (e.g. best vs last ckpt).
+    We use (epoch, ckpt_path) as a compound key so rows from different
+    checkpoints at the same epoch are never mixed.
+    """
     if not rows:
         return []
-    max_epoch = max(r["epoch"] for r in rows)
-    return [r for r in rows if r["epoch"] == max_epoch]
+    # max by epoch first; use ckpt_path as lexicographic tiebreak
+    best = max(rows, key=lambda r: (r["epoch"], r["ckpt_path"]))
+    target_epoch = best["epoch"]
+    target_ckpt  = best["ckpt_path"]
+    return [r for r in rows if r["epoch"] == target_epoch and r["ckpt_path"] == target_ckpt]
 
 
 def confusion_matrix(gts: list[int], preds: list[int], num_classes: int) -> np.ndarray:
@@ -146,9 +157,12 @@ def diagnose_directory(results_dir: Path, run_type: str = "test", num_classes: i
         if lines:
             try:
                 frame_stats = json.loads(lines[-1])
-                print(f"\n  Frame-level (last epoch): "
-                      f"acc_max={frame_stats.get('acc_max_metric', '?'):.4f}  "
-                      f"mae_max={frame_stats.get('mae_max_metric', '?'):.4f}")
+                acc_val = frame_stats.get("acc_max_metric", "?")
+                mae_val = frame_stats.get("mae_max_metric", "?")
+                # guard against missing fields returning the '?' sentinel (a str)
+                acc_str = f"{acc_val:.4f}" if isinstance(acc_val, float) else str(acc_val)
+                mae_str = f"{mae_val:.4f}" if isinstance(mae_val, float) else str(mae_val)
+                print(f"\n  Frame-level (last epoch): acc_max={acc_str}  mae_max={mae_str}")
             except json.JSONDecodeError:
                 pass
 

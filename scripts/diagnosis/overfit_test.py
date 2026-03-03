@@ -23,6 +23,8 @@ Interpretation:
     train_acc < 30% after  50 epochs → fundamental problem (labels/norm/data)
 """
 
+from __future__ import annotations  # Python 3.8 compatible PEP585 generics
+
 import argparse
 import json
 import os
@@ -123,7 +125,11 @@ def main() -> None:
             acc_max = last.get("acc_max_metric", "?")
             acc_exp = last.get("acc_exp_metric", "?")
             mae_max = last.get("mae_max_metric", "?")
-            print(f"  val(=train) acc_max={acc_max:.4f}  acc_exp={acc_exp:.4f}  mae_max={mae_max:.4f}")
+            # guard against missing fields returning the '?' sentinel (a str, not float)
+            fmt_acc_max = f"{acc_max:.4f}" if isinstance(acc_max, float) else str(acc_max)
+            fmt_acc_exp = f"{acc_exp:.4f}" if isinstance(acc_exp, float) else str(acc_exp)
+            fmt_mae_max = f"{mae_max:.4f}" if isinstance(mae_max, float) else str(mae_max)
+            print(f"  val(=train) acc_max={fmt_acc_max}  acc_exp={fmt_acc_exp}  mae_max={fmt_mae_max}")
 
             if isinstance(acc_max, float):
                 if acc_max > 0.70:
