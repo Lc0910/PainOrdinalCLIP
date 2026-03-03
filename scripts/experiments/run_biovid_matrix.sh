@@ -13,8 +13,11 @@
 #   D. OrdinalCLIP-frozen   (rank interpolation, frozen image encoder)
 #   E. OrdinalCLIP-finetune (rank interpolation, lr_img=1e-5)
 #
-# Key fix vs previous run: added freeze-image.yaml to CoOp/OrdinalCLIP.
-# Previous run had lr_image_encoder=1e-4 (default) which destroyed CLIP features.
+# Key fixes vs previous run:
+#   1. freeze-image.yaml added to CoOp/OrdinalCLIP (lr_image_encoder was 1e-4)
+#   2. clip-normalize.yaml added to ALL experiments
+#      default.yaml uses ImageNet mean/std; CLIP requires its own normalization
+#      (std differs by 17% → corrupts CLIP attention weights → ~random accuracy)
 #
 # Usage:
 #   bash scripts/experiments/run_biovid_matrix.sh
@@ -33,6 +36,8 @@ set -euo pipefail
 # ---- Config shortcuts -------------------------------------
 DEFAULT_CFG="configs/default.yaml"
 BIOVID_CFG="configs/base_cfgs/data_cfg/datasets/biovid/biovid.yaml"
+# FIX: Use CLIP's own normalization instead of ImageNet default
+CLIP_NORM="configs/base_cfgs/data_cfg/transforms/clip-normalize.yaml"
 FREEZE_IMG="configs/base_cfgs/runner_cfg/optim_sched/image_encoder/freeze-image.yaml"
 FINETUNE_IMG_1E5="configs/base_cfgs/runner_cfg/optim_sched/image_encoder/tune-image-1e-5.yaml"
 COSINE_LR="configs/base_cfgs/runner_cfg/optim_sched/lr_decay/lr_decay_cosine_max_epochs_100.yaml"
@@ -85,6 +90,7 @@ run_one() {
     python scripts/run.py \
         --config "${DEFAULT_CFG}" \
         --config "${BIOVID_CFG}" \
+        --config "${CLIP_NORM}" \
         "$@" \
         --output_dir "${output_dir}" \
         ${TEST_ONLY_FLAG} \
