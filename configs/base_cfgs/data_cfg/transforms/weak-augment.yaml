@@ -1,0 +1,4 @@
+data_cfg:
+  transforms_cfg:
+    input_transforms:
+      - normalize
