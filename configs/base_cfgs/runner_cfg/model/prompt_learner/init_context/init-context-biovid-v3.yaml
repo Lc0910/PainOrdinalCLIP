@@ -1,0 +1,6 @@
+# BioVid v3: shorter, expression-focused
+# Construct: "a facial expression of [rank]"
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      init_context: "a facial expression of"

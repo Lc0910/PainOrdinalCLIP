@@ -1,0 +1,6 @@
+# BioVid v2: CLIP-aligned photo description style
+# Construct: "a photo of a face showing [rank]"
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      init_context: "a photo of a face showing"
