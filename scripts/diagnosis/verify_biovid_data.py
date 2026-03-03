@@ -23,6 +23,8 @@ Usage:
         --check_images --n_sample_images 100
 """
 
+from __future__ import annotations  # Python 3.8 compatible PEP585 generics
+
 import argparse
 import os
 import random
