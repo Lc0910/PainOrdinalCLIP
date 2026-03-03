@@ -1,0 +1,22 @@
+# CLIP official normalization parameters.
+# These MUST be used when the image backbone is any CLIP model (RN50, ViT-B/16, etc.).
+# Using ImageNet normalization (default.yaml) degrades CLIP features significantly.
+#
+# Source: CLIP/clip/clip.py :: _transform()
+#   Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+#
+# ImageNet default (wrong for CLIP):
+#   mean [0.485, 0.456, 0.406]  std [0.229, 0.224, 0.225]
+#
+# CLIP vs ImageNet std difference: ~17% → shifts effective input scale,
+# corrupts CLIP's internal attention weights.
+data_cfg:
+  transforms_cfg:
+    pixel_mean:
+      - 0.48145466
+      - 0.4578275
+      - 0.40821073
+    pixel_std:
+      - 0.26862954
+      - 0.26130258
+      - 0.27577711
