@@ -58,7 +58,7 @@ class Runner(pl.LightningModule):
         return self.module(images)
 
     def forward_text_only(self):
-        return self.forward_text_only()
+        return self.module.forward_text_only()
 
     # Running Steps
     def run_step(self, batch, batch_idx):

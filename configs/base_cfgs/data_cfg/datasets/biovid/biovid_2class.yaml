@@ -1,0 +1,10 @@
+data_cfg:
+  train_data_file: data/biovid/train_2class.txt
+  val_data_file:   data/biovid/test_2class.txt
+  test_data_file:  data/biovid/test_2class.txt
+
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      num_ranks: 2
+      init_rank_path: configs/base_cfgs/data_cfg/datasets/biovid/classnames_2class.txt
