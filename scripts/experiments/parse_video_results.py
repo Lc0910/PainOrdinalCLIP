@@ -95,6 +95,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", "-o", type=str, default="results/stats/")
     parser.add_argument("--output_name", "-n", type=str, default=None)
     parser.add_argument("--run_type", "-r", type=str, default="test", choices=("test", "val"))
+    parser.add_argument("--filter", "-f", type=str, default=None,
+                        help="Only include experiments whose exp_name contains this substring")
     args = parser.parse_args()
 
     print(f"Scanning: {args.results_dir}")
@@ -103,6 +105,12 @@ if __name__ == "__main__":
     if stats is None or stats.empty:
         print(f"No {args.run_type}_stats.json or {args.run_type}_video_stats.json found under {args.results_dir}")
         exit(1)
+
+    if args.filter and "exp_name" in stats.columns:
+        stats = stats[stats["exp_name"].str.contains(args.filter, case=False, na=False)]
+        if stats.empty:
+            print(f"No experiments matching filter '{args.filter}'")
+            exit(1)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

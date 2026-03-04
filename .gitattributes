@@ -1,0 +1,24 @@
+# Force LF line endings for shell scripts on all platforms
+*.sh    text eol=lf
+
+# Python / YAML / text: normalize to LF
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+
+# Windows-only artifacts: keep CRLF (if any)
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binaries: no conversion
+*.pt    binary
+*.pth   binary
+*.pkl   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
