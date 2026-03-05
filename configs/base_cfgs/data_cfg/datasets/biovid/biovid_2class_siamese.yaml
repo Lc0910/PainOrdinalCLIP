@@ -1,0 +1,15 @@
+# BioVid 2-class data config for Siamese Stage 2
+# Maps overrides to runner_cfg.backbone_cfg (not model_cfg)
+data_cfg:
+  train_images_root: data/biovid
+  val_images_root: data/biovid
+  test_images_root: data/biovid
+  train_data_file: data/biovid/train_2class.txt
+  val_data_file:   data/biovid/test_2class.txt
+  test_data_file:  data/biovid/test_2class.txt
+
+runner_cfg:
+  backbone_cfg:
+    prompt_learner_cfg:
+      num_ranks: 2
+      init_rank_path: configs/base_cfgs/data_cfg/datasets/biovid/classnames_2class.txt

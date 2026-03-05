@@ -49,7 +49,7 @@
 set -euo pipefail
 
 SIAMESE_CFG="configs/siamese_default.yaml"
-BIOVID2_CFG="configs/base_cfgs/data_cfg/datasets/biovid/biovid_2class.yaml"
+BIOVID2_CFG="configs/base_cfgs/data_cfg/datasets/biovid/biovid_2class_siamese.yaml"
 CLIP_NORM="configs/base_cfgs/data_cfg/transforms/clip-normalize.yaml"
 
 # Stage 1 best checkpoint (CoOp-ft 1e-5 ViT-B/16)
