@@ -68,11 +68,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Helper: find best checkpoint by lowest metric value in filename.
+# Filenames: epoch=XX-val_mae_max_metric=Y.YYYY.ckpt  (lower metric = better)
+find_best_ckpt() {
+    local search_dir="$1"
+    find "${search_dir}" -name "epoch=*.ckpt" -not -name "last.ckpt" 2>/dev/null \
+        | sort -t'=' -k3 -n \
+        | head -1
+}
+
 # Auto-detect backbone checkpoint if not specified
 if [[ -z "${BACKBONE_CKPT}" ]]; then
     CKPT_DIR="results/biovid-2cls-coop-finetune1e5-vitb16"
-    # Find the latest version with a best checkpoint
-    BACKBONE_CKPT=$(find "${CKPT_DIR}" -name "epoch=*.ckpt" -not -name "last.ckpt" 2>/dev/null | head -1 || true)
+    BACKBONE_CKPT=$(find_best_ckpt "${CKPT_DIR}")
     if [[ -z "${BACKBONE_CKPT}" ]]; then
         echo "ERROR: No Stage 1 checkpoint found in ${CKPT_DIR}/"
         echo "Run Stage 1 first or specify --backbone_ckpt <path>"
@@ -83,26 +91,43 @@ fi
 
 run_siamese() {
     local label="$1"; local output_dir="$2"; shift 2
-    # Remaining "$@" are bare key=value pairs (NO --cfg_options prefix).
-    # This function wraps them together with base options under a single
-    # --cfg_options (argparse.REMAINDER captures everything after it).
+    # Remaining "$@" are a mix of:
+    #   --flags   (e.g. --test_only)  → placed BEFORE --cfg_options
+    #   key=value (e.g. runner_cfg.x=y) → placed AFTER --cfg_options
+    # We separate them so argparse.REMAINDER doesn't swallow the flags.
+    # NOTE: Only valueless flags (--test_only, --debug) are supported.
+    # Flags with values (--config path) must be added to the python call directly.
+    local extra_flags=()
+    local cfg_opts=()
+    for arg in "$@"; do
+        if [[ "$arg" == --* ]]; then
+            extra_flags+=("$arg")
+        else
+            cfg_opts+=("$arg")
+        fi
+    done
+
     echo ""
     echo "============================================================"
     echo " ${label}"
     echo " output: ${output_dir}"
     echo " backbone: ${BACKBONE_CKPT}"
+    if [[ ${#extra_flags[@]} -gt 0 ]]; then
+        echo " flags: ${extra_flags[*]}"
+    fi
     echo "============================================================"
     python scripts/run_siamese.py \
         --config "${SIAMESE_CFG}" \
         --config "${BIOVID2_CFG}" \
         --config "${CLIP_NORM}" \
         --output_dir "${output_dir}" \
+        "${extra_flags[@]}" \
         --cfg_options \
         trainer_cfg.max_epochs=${MAX_EPOCHS} \
         runner_cfg.optimizer_and_scheduler_cfg.lr_scheduler_cfg.max_epochs=${MAX_EPOCHS} \
         runner_cfg.load_weights_cfg.backbone_ckpt_path="${BACKBONE_CKPT}" \
         data_cfg.pairs_per_epoch=${PAIRS_PER_EPOCH} \
-        "$@"
+        "${cfg_opts[@]}"
 }
 
 should_run() {
@@ -157,6 +182,75 @@ if should_run "H"; then
         runner_cfg.loss_weights.ce_loss_a=0.5 \
         runner_cfg.loss_weights.ce_loss_b=0.5 \
         runner_cfg.ranking_head_cfg.head_type=linear
+fi
+
+# ============================================================
+# I. Anchor inference on F checkpoint — ensemble α=0.5
+#    TEST-ONLY: loads F's trained ranking head, computes anchors,
+#    evaluates with ensemble α=0.5 (cls weight).
+# ============================================================
+if should_run "I"; then
+    # Find F's best checkpoint (contains trained ranking head weights)
+    F_CKPT=$(find_best_ckpt "results/biovid-2cls-siamese-F-joint-mlp")
+    if [[ -z "${F_CKPT}" ]]; then
+        echo "SKIP I: No F checkpoint found. Run experiment F first."
+    else
+        echo "Using F checkpoint: ${F_CKPT}"
+        run_siamese "2cls-I | Anchor ensemble α=0.5 | F ckpt (test-only)" \
+            "results/biovid-2cls-siamese-I-anchor-ens05" \
+            --test_only \
+            runner_cfg.ckpt_path="${F_CKPT}" \
+            runner_cfg.ranking_head_cfg.head_type=mlp \
+            runner_cfg.anchor_inference_cfg.enabled=true \
+            runner_cfg.anchor_inference_cfg.ensemble_alpha=0.5 \
+            runner_cfg.anchor_inference_cfg.anchor_mode=single
+    fi
+fi
+
+# ============================================================
+# J. Anchor inference on F checkpoint — rank-only (α=0.0)
+#    TEST-ONLY: pure ranking head prediction without cls fusion.
+# ============================================================
+if should_run "J"; then
+    F_CKPT=$(find_best_ckpt "results/biovid-2cls-siamese-F-joint-mlp")
+    if [[ -z "${F_CKPT}" ]]; then
+        echo "SKIP J: No F checkpoint found. Run experiment F first."
+    else
+        echo "Using F checkpoint: ${F_CKPT}"
+        run_siamese "2cls-J | Anchor rank-only α=0.0 | F ckpt (test-only)" \
+            "results/biovid-2cls-siamese-J-anchor-rank-only" \
+            --test_only \
+            runner_cfg.ckpt_path="${F_CKPT}" \
+            runner_cfg.ranking_head_cfg.head_type=mlp \
+            runner_cfg.anchor_inference_cfg.enabled=true \
+            runner_cfg.anchor_inference_cfg.ensemble_alpha=0.0 \
+            runner_cfg.anchor_inference_cfg.anchor_mode=single
+    fi
+fi
+
+# ============================================================
+# K. Alpha sweep on F checkpoint — α ∈ {0.0, 0.1, ..., 1.0}
+#    TEST-ONLY: 11 runs with different ensemble weights.
+#    α=1.0 → pure cls (baseline), α=0.0 → pure rank.
+# ============================================================
+if should_run "K"; then
+    F_CKPT=$(find_best_ckpt "results/biovid-2cls-siamese-F-joint-mlp")
+    if [[ -z "${F_CKPT}" ]]; then
+        echo "SKIP K: No F checkpoint found. Run experiment F first."
+    else
+        echo "Using F checkpoint: ${F_CKPT}"
+        for alpha in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0; do
+            alpha_tag=$(echo "${alpha}" | tr '.' '')
+            run_siamese "2cls-K | Alpha sweep α=${alpha} | F ckpt (test-only)" \
+                "results/biovid-2cls-siamese-K-alpha-${alpha_tag}" \
+                --test_only \
+                runner_cfg.ckpt_path="${F_CKPT}" \
+                runner_cfg.ranking_head_cfg.head_type=mlp \
+                runner_cfg.anchor_inference_cfg.enabled=true \
+                runner_cfg.anchor_inference_cfg.ensemble_alpha=${alpha} \
+                runner_cfg.anchor_inference_cfg.anchor_mode=single
+        done
+    fi
 fi
 
 echo ""

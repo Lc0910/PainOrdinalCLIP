@@ -77,6 +77,14 @@ runner_cfg:
 
   ckpt_path: ""
 
+  # --- Anchor-Based Ranking Inference ---
+  anchor_inference_cfg:
+    enabled: false               # set true to use ranking head at inference
+    ensemble_alpha: 0.5          # cls weight: 1.0 = pure cls, 0.0 = pure rank
+    anchor_mode: single          # "single" (anchor_0 only) or "dual" (both anchors)
+    save_anchors: true           # save anchors.pt to output_dir
+    load_anchors_path: null      # explicit path to load pre-computed anchors
+
 # ==============================================================================
 # Data Config
 # ==============================================================================
