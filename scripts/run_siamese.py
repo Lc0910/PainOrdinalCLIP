@@ -52,7 +52,35 @@ def main(cfg: DictConfig) -> None:
         trainer.fit(model=runner, datamodule=datamodule)
         logger.info("End training.")
 
-    # Testing — iterate over saved checkpoints
+    # ------------------------------------------------------------------
+    # Testing
+    # ------------------------------------------------------------------
+    # External checkpoint mode: when test_only + ckpt_path is specified
+    # (e.g., experiment F's trained checkpoint loaded for anchor-based
+    # inference in experiments I/J/K).
+    # IMPORTANT: If ckpt_path is specified but file doesn't exist, fail-fast
+    # to avoid silently degrading to zero-shot (P0 risk for I/J/K experiments).
+    ext_ckpt_path = cfg.runner_cfg.get("ckpt_path", "")
+    if cfg.test_only and ext_ckpt_path:
+        if not Path(ext_ckpt_path).is_file():
+            raise FileNotFoundError(
+                f"External checkpoint not found: {ext_ckpt_path}\n"
+                f"Cannot run test-only without a valid checkpoint. "
+                f"Check the path or run training first."
+            )
+        logger.info(f"Test-only with external checkpoint: {ext_ckpt_path}")
+        runner_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+        # Clear backbone loading — full weights come from PL checkpoint
+        for k in runner_kwargs.get("load_weights_cfg", {}):
+            runner_kwargs["load_weights_cfg"][k] = None
+        runner = SiameseRunner.load_from_checkpoint(
+            ext_ckpt_path, **runner_kwargs
+        )
+        trainer.test(model=runner, datamodule=datamodule)
+        logger.info(f"End testing external ckpt: {ext_ckpt_path}")
+        return  # skip local checkpoint iteration
+
+    # Iterate over saved checkpoints in output_dir/ckpts/
     ckpt_paths = list((output_dir / "ckpts").glob("*.ckpt"))
     if len(ckpt_paths) == 0:
         logger.info("No checkpoints found — running zero-shot test.")
@@ -64,16 +92,18 @@ def main(cfg: DictConfig) -> None:
     for ckpt_path in ckpt_paths:
         logger.info(f"Start testing ckpt: {ckpt_path}.")
 
-        # Clear load_weights_cfg — weights come from PL checkpoint
-        for k in cfg.runner_cfg.load_weights_cfg.keys():
-            cfg.runner_cfg.load_weights_cfg[k] = None
-        cfg.runner_cfg.ckpt_path = str(ckpt_path)
+        # Work on a copy to avoid mutating OmegaConf struct
+        runner_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+        # Clear backbone loading — weights come from PL checkpoint
+        for k in runner_kwargs.get("load_weights_cfg", {}):
+            runner_kwargs["load_weights_cfg"][k] = None
+        runner_kwargs["ckpt_path"] = str(ckpt_path)
 
         if runner is None:
-            runner = SiameseRunner(**OmegaConf.to_container(cfg.runner_cfg))
+            runner = SiameseRunner(**runner_kwargs)
 
         runner = runner.load_from_checkpoint(
-            str(ckpt_path), **OmegaConf.to_container(cfg.runner_cfg)
+            str(ckpt_path), **runner_kwargs
         )
         trainer.test(model=runner, datamodule=datamodule)
 

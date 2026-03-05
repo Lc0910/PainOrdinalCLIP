@@ -55,6 +55,7 @@ class SiameseRunner(pl.LightningModule):
         loss_weights: Optional[Dict] = None,
         freeze_backbone: bool = True,
         ckpt_path: str = "",
+        anchor_inference_cfg: Optional[Dict] = None,
     ) -> None:
         super().__init__()
 
@@ -102,6 +103,10 @@ class SiameseRunner(pl.LightningModule):
         # --- Epoch-level ranking metric accumulators ---
         self._train_ranking_probs: List[torch.Tensor] = []
         self._train_ranking_labels: List[torch.Tensor] = []
+
+        # --- Anchor-based ranking inference (disabled by default) ---
+        self._anchor_cfg: Dict = anchor_inference_cfg or {"enabled": False}
+        self._anchors: Optional[Dict[int, torch.Tensor]] = None
 
     # ================================================================
     #  Forward
@@ -180,15 +185,31 @@ class SiameseRunner(pl.LightningModule):
         return self._eval_step(batch)
 
     def _eval_step(self, batch):
-        """Single-image classification evaluation (reuses Runner logic)."""
+        """Single-image classification + optional anchor-based ranking evaluation."""
         x, y = batch[0], batch[1]  # [B, 3, H, W], [B]
-        logits, *_ = self.module.forward_single(x)  # [B, num_ranks]
+
+        # Capture image_features (previously discarded with *_)
+        logits, image_features, _ = self.module.forward_single(x)
+        # logits: [B, num_ranks], image_features: [B, D]
 
         ce_loss = self.ce_loss_func(logits, y)
         metrics_exp = self.compute_per_example_metrics(logits, y, "exp")
         metrics_max = self.compute_per_example_metrics(logits, y, "max")
 
         outputs = {"loss": ce_loss, "ce_loss": ce_loss, **metrics_exp, **metrics_max}
+
+        # Anchor-based ranking inference (when anchors are available).
+        # Note: Baseline.forward() returns (logits, None, None), so
+        # image_features may be None — skip anchor inference in that case.
+        if self._anchors is not None and image_features is not None:
+            rank_metrics = self._compute_rank_predictions(image_features, y)
+            p_rank = rank_metrics.pop("_p_rank")  # [B, num_ranks], internal
+            outputs.update(rank_metrics)
+
+            p_cls = F.softmax(logits, dim=-1)  # [B, num_ranks]
+            ens_metrics = self._compute_ensemble_predictions(p_cls, p_rank, y)
+            outputs.update(ens_metrics)
+
         if len(batch) > 2:
             outputs["_paths"] = batch[2]
             outputs["_targets"] = batch[1]
@@ -242,11 +263,18 @@ class SiameseRunner(pl.LightningModule):
 
         video_id derived by stripping trailing frame index from filename:
             images/071309_w_21-BL1-081_27.jpg -> 071309_w_21-BL1-081
+
+        Supports optional rank and ensemble predictions when anchors are active.
         """
+        has_rank = any("predict_y_rank" in o for o in outputs)
+        has_ens = any("predict_y_ens" in o for o in outputs)
+
         all_paths: List[str] = []
         all_targets: List[torch.Tensor] = []
         all_pred_exp: List[torch.Tensor] = []
         all_pred_max: List[torch.Tensor] = []
+        all_pred_rank: List[torch.Tensor] = []
+        all_pred_ens: List[torch.Tensor] = []
 
         for _outputs in outputs:
             if "_paths" not in _outputs:
@@ -255,17 +283,28 @@ class SiameseRunner(pl.LightningModule):
             all_targets.append(_outputs["_targets"].detach().cpu().float())
             all_pred_exp.append(_outputs["predict_y_exp"].detach().cpu().float())
             all_pred_max.append(_outputs["predict_y_max"].detach().cpu().float())
+            if has_rank:
+                all_pred_rank.append(_outputs["predict_y_rank"].detach().cpu().float())
+            if has_ens:
+                all_pred_ens.append(_outputs["predict_y_ens"].detach().cpu().float())
 
         if not all_paths:
             return
 
-        all_targets_t = torch.cat(all_targets)  # [N]
+        all_targets_t = torch.cat(all_targets)    # [N]
         all_pred_exp_t = torch.cat(all_pred_exp)  # [N]
         all_pred_max_t = torch.cat(all_pred_max)  # [N]
+        all_pred_rank_t = torch.cat(all_pred_rank) if has_rank else None  # [N]
+        all_pred_ens_t = torch.cat(all_pred_ens) if has_ens else None    # [N]
 
         # Group by video_id
+        group_keys = ["targets", "pred_exp", "pred_max"]
+        if has_rank:
+            group_keys.append("pred_rank")
+        if has_ens:
+            group_keys.append("pred_ens")
         video_groups: Dict[str, dict] = defaultdict(
-            lambda: {"targets": [], "pred_exp": [], "pred_max": []}
+            lambda: {k: [] for k in group_keys}
         )
         for i, path in enumerate(all_paths):
             stem = PurePosixPath(path).stem
@@ -273,10 +312,16 @@ class SiameseRunner(pl.LightningModule):
             video_groups[video_id]["targets"].append(all_targets_t[i].item())
             video_groups[video_id]["pred_exp"].append(all_pred_exp_t[i].item())
             video_groups[video_id]["pred_max"].append(all_pred_max_t[i].item())
+            if has_rank:
+                video_groups[video_id]["pred_rank"].append(all_pred_rank_t[i].item())
+            if has_ens:
+                video_groups[video_id]["pred_ens"].append(all_pred_ens_t[i].item())
 
         # Compute video-level metrics
         video_mae_exp, video_mae_max = [], []
         video_acc_exp, video_acc_max = [], []
+        video_mae_rank, video_acc_rank = [], []
+        video_mae_ens, video_acc_ens = [], []
         video_predictions = []
 
         for vid, data in video_groups.items():
@@ -290,13 +335,27 @@ class SiameseRunner(pl.LightningModule):
             video_acc_exp.append(1.0 if round(pred_exp) == gt else 0.0)
             video_acc_max.append(1.0 if round(pred_max) == gt else 0.0)
 
-            video_predictions.append({
+            row = {
                 "video_id": vid,
                 "gt": int(gt),
                 "pred_exp": round(pred_exp, 4),
                 "pred_max": round(pred_max, 4),
                 "n_frames": len(data["targets"]),
-            })
+            }
+
+            if has_rank:
+                pred_rank = sum(data["pred_rank"]) / len(data["pred_rank"])
+                video_mae_rank.append(abs(pred_rank - gt))
+                video_acc_rank.append(1.0 if round(pred_rank) == gt else 0.0)
+                row["pred_rank"] = round(pred_rank, 4)
+
+            if has_ens:
+                pred_ens = sum(data["pred_ens"]) / len(data["pred_ens"])
+                video_mae_ens.append(abs(pred_ens - gt))
+                video_acc_ens.append(1.0 if round(pred_ens) == gt else 0.0)
+                row["pred_ens"] = round(pred_ens, 4)
+
+            video_predictions.append(row)
 
         n_videos = len(video_groups)
         video_stats = {
@@ -309,14 +368,25 @@ class SiameseRunner(pl.LightningModule):
             "output_dir": str(self.output_dir),
             "ckpt_path": str(self.ckpt_path),
         }
+        if has_rank:
+            video_stats["mae_rank_metric"] = sum(video_mae_rank) / n_videos
+            video_stats["acc_rank_metric"] = sum(video_acc_rank) / n_videos
+        if has_ens:
+            video_stats["mae_ens_metric"] = sum(video_mae_ens) / n_videos
+            video_stats["acc_ens_metric"] = sum(video_acc_ens) / n_videos
+
         with open(str(self.output_dir / f"{run_type}_video_stats.json"), "a") as f:
             f.write(json.dumps(video_stats) + "\n")
 
         # Per-video predictions CSV
         csv_path = self.output_dir / f"{run_type}_video_predictions.csv"
         csv_exists = csv_path.exists()
+        fieldnames = ["epoch", "ckpt_path", "video_id", "gt", "pred_exp", "pred_max", "n_frames"]
+        if has_rank:
+            fieldnames.append("pred_rank")
+        if has_ens:
+            fieldnames.append("pred_ens")
         with open(str(csv_path), "a", newline="") as f:
-            fieldnames = ["epoch", "ckpt_path", "video_id", "gt", "pred_exp", "pred_max", "n_frames"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not csv_exists:
                 writer.writeheader()
@@ -325,13 +395,23 @@ class SiameseRunner(pl.LightningModule):
                 row["ckpt_path"] = str(self.ckpt_path)
             writer.writerows(video_predictions)
 
-        logger.info(
+        log_msg = (
             f"[{run_type}] video-level: {n_videos} videos, "
             f"mae_exp={video_stats['mae_exp_metric']:.4f}, "
             f"mae_max={video_stats['mae_max_metric']:.4f}, "
             f"acc_exp={video_stats['acc_exp_metric']:.4f}, "
             f"acc_max={video_stats['acc_max_metric']:.4f}"
         )
+        if has_rank:
+            log_msg += (
+                f", acc_rank={video_stats['acc_rank_metric']:.4f}"
+            )
+        if has_ens:
+            log_msg += (
+                f", acc_ens={video_stats['acc_ens_metric']:.4f}"
+                f" (alpha={self._anchor_cfg.get('ensemble_alpha', 0.5)})"
+            )
+        logger.info(log_msg)
 
     # ================================================================
     #  Metrics
@@ -388,6 +468,100 @@ class SiameseRunner(pl.LightningModule):
         pos_rank_sum = ranks[sorted_labels == 1].sum().item()
         auc = 1.0 - (pos_rank_sum - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
         return max(0.0, min(1.0, auc))
+
+    # ================================================================
+    #  Anchor-Based Rank / Ensemble Predictions
+    # ================================================================
+
+    def _compute_rank_predictions(
+        self, image_features: torch.Tensor, y: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Compute rank-based predictions using anchors and ranking head.
+
+        For 2-class:
+          single mode: P(class=1) = sigmoid(ranking_head(f_x - anchor_0))
+          dual mode:   average of P(x > anchor_0) and (1 - P(x > anchor_1))
+
+        Note: Currently only supports 2-class (binary pain classification).
+        For multi-class, a per-class-vs-all scheme would be needed.
+
+        Args:
+            image_features: [B, D] L2-normalized features from backbone.
+            y: [B] ground truth labels.
+
+        Returns:
+            Dict with mae_rank_metric, acc_rank_metric, predict_y_rank, _p_rank.
+        """
+        if self.num_ranks != 2:
+            raise NotImplementedError(
+                f"Anchor-based rank predictions only support 2-class "
+                f"(got num_ranks={self.num_ranks}). "
+                f"For multi-class, implement per-class-vs-all ranking."
+            )
+        dtype = image_features.dtype
+        anchor_0 = self._anchors[0].to(image_features.device).type(dtype)  # [D]
+
+        feat_diff_0 = image_features - anchor_0.unsqueeze(0)  # [B, D]
+        rank_logit_0 = self.module.ranking_head(feat_diff_0)   # [B, 1]
+        rank_score = torch.sigmoid(rank_logit_0).squeeze(1)    # [B]
+
+        if self._anchor_cfg.get("anchor_mode", "single") == "dual" and 1 in self._anchors:
+            anchor_1 = self._anchors[1].to(image_features.device).type(dtype)  # [D]
+            feat_diff_1 = image_features - anchor_1.unsqueeze(0)  # [B, D]
+            rank_logit_1 = self.module.ranking_head(feat_diff_1)   # [B, 1]
+            rank_score_1 = torch.sigmoid(rank_logit_1).squeeze(1)  # [B]
+            # Dual: average P(x > nopain) and P(x NOT > pain)
+            rank_score = (rank_score + (1.0 - rank_score_1)) / 2.0  # [B]
+
+        predict_y_rank = rank_score  # [B], continuous in [0, 1]
+        p_rank = torch.stack([1.0 - rank_score, rank_score], dim=1)  # [B, 2]
+
+        y_float = y.type(dtype)
+        mae_rank = torch.abs(predict_y_rank - y_float)                  # [B]
+        acc_rank = (torch.round(predict_y_rank) == y_float).type(dtype)  # [B]
+
+        return {
+            "mae_rank_metric": mae_rank,
+            "acc_rank_metric": acc_rank,
+            "predict_y_rank": predict_y_rank,
+            "_p_rank": p_rank,  # internal: used by ensemble, excluded from logging
+        }
+
+    def _compute_ensemble_predictions(
+        self,
+        p_cls: torch.Tensor,
+        p_rank: torch.Tensor,
+        y: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute ensembled cls + rank predictions.
+
+        p_final = alpha * p_cls + (1 - alpha) * p_rank
+
+        Args:
+            p_cls:  [B, num_ranks] softmax classification probabilities.
+            p_rank: [B, num_ranks] rank-based class probabilities.
+            y: [B] ground truth labels.
+
+        Returns:
+            Dict with mae_ens_metric, acc_ens_metric, predict_y_ens.
+        """
+        alpha = self._anchor_cfg.get("ensemble_alpha", 0.5)
+        dtype = p_cls.dtype
+
+        p_ens = alpha * p_cls + (1.0 - alpha) * p_rank  # [B, num_ranks]
+
+        rank_values = self.rank_output_value_array.type(dtype)  # [num_ranks]
+        predict_y_ens = torch.sum(p_ens * rank_values, dim=-1)  # [B]
+
+        y_float = y.type(dtype)
+        mae_ens = torch.abs(predict_y_ens - y_float)                    # [B]
+        acc_ens = (torch.round(predict_y_ens) == y_float).type(dtype)  # [B]
+
+        return {
+            "mae_ens_metric": mae_ens,
+            "acc_ens_metric": acc_ens,
+            "predict_y_ens": predict_y_ens,
+        }
 
     # ================================================================
     #  Optimizer & Scheduler
@@ -474,6 +648,131 @@ class SiameseRunner(pl.LightningModule):
 
     def on_fit_start(self) -> None:
         pl.seed_everything(self.seed, workers=True)
+
+    def on_fit_end(self) -> None:
+        """Compute and save anchors after training completes."""
+        if not self._anchor_cfg.get("enabled", False):
+            return
+        logger.info("Computing class anchors from training data...")
+        self._anchors = self._compute_anchors()
+        if self._anchor_cfg.get("save_anchors", True):
+            self._save_anchors(self._anchors)
+
+    def on_test_start(self) -> None:
+        """Load or compute anchors before test begins."""
+        if not self._anchor_cfg.get("enabled", False):
+            return
+        if self._anchors is not None:
+            return  # already computed (e.g., after fit)
+
+        # Try loading from explicit path or default location
+        load_path = self._anchor_cfg.get("load_anchors_path")
+        if load_path is None:
+            load_path = str(self.output_dir / "anchors.pt")
+
+        if Path(load_path).exists():
+            self._anchors = self._load_anchors(load_path)
+        else:
+            if self.trainer.datamodule is None:
+                raise RuntimeError(
+                    f"No saved anchors at '{load_path}' and "
+                    "trainer.datamodule is None. "
+                    "Pass datamodule= to trainer.test() or set "
+                    "anchor_inference_cfg.load_anchors_path."
+                )
+            logger.info("No saved anchors found, computing from training data...")
+            self._anchors = self._compute_anchors()
+            if self._anchor_cfg.get("save_anchors", True):
+                self._save_anchors(self._anchors)
+
+        # Warn if backbone doesn't produce image_features (e.g. Baseline)
+        from ordinalclip.models.baseline import Baseline
+        if isinstance(self.module.backbone, Baseline):
+            logger.warning(
+                "Anchor inference enabled but backbone is Baseline "
+                "(returns image_features=None). "
+                "Rank/ensemble predictions will be skipped at eval time."
+            )
+
+    # ================================================================
+    #  Anchor-Based Ranking Inference
+    # ================================================================
+
+    @torch.no_grad()
+    def _compute_anchors(self) -> Dict[int, torch.Tensor]:
+        """Compute per-class feature centroids from training data.
+
+        Iterates the training set as single images (with eval transforms),
+        extracts L2-normalized image features via forward_single(), and
+        averages per class.  Centroids are re-normalized to unit length.
+
+        Returns:
+            Dict mapping class label (int) to centroid tensor [D].
+        """
+        anchor_loader = self.trainer.datamodule.anchor_dataloader()
+        feat_accum: Dict[int, List[torch.Tensor]] = defaultdict(list)
+
+        was_training = self.training
+        self.eval()  # eval on entire LightningModule (not just self.module)
+
+        try:
+            for batch in anchor_loader:
+                images = batch[0].to(self.device)             # [B, 3, H, W]
+                labels = batch[1]                              # [B]
+                _, image_features, _ = self.module.forward_single(images)
+                # image_features: [B, D], already L2-normalized by OrdinalCLIP
+                image_features = image_features.float().cpu()  # fp32 for accumulation
+                for i in range(labels.size(0)):
+                    feat_accum[labels[i].item()].append(image_features[i])
+        finally:
+            if was_training:
+                self.train()
+
+        # Validate: all expected classes must be present for anchor inference.
+        # Missing classes would cause KeyError in _compute_rank_predictions.
+        expected_labels = set(range(self.num_ranks))
+        actual_labels = set(feat_accum.keys())
+        if not expected_labels.issubset(actual_labels):
+            missing = expected_labels - actual_labels
+            raise ValueError(
+                f"Anchor computation failed: classes {missing} not found "
+                f"in training data (expected {expected_labels}, "
+                f"got {actual_labels}). Check data annotations."
+            )
+        if actual_labels != expected_labels:
+            extra = actual_labels - expected_labels
+            logger.warning(
+                f"Unexpected label values {extra} in training data "
+                f"(expected {expected_labels}). These will be ignored."
+            )
+
+        anchors: Dict[int, torch.Tensor] = {}
+        for label in sorted(feat_accum.keys()):
+            stacked = torch.stack(feat_accum[label])       # [N_label, D]
+            centroid = stacked.mean(dim=0)                  # [D]
+            centroid = F.normalize(centroid, dim=0)          # re-normalize
+            anchors[label] = centroid
+            logger.info(
+                f"Anchor class {label}: {len(feat_accum[label])} samples, "
+                f"centroid norm={centroid.norm().item():.4f}"
+            )
+
+        return anchors
+
+    def _save_anchors(self, anchors: Dict[int, torch.Tensor]) -> None:
+        """Save anchors to output_dir/anchors.pt."""
+        path = self.output_dir / "anchors.pt"
+        torch.save(anchors, str(path))
+        logger.info(f"Saved {len(anchors)} class anchors to {path}")
+
+    def _load_anchors(self, path: str) -> Dict[int, torch.Tensor]:
+        """Load pre-computed anchors from file.
+
+        Always loads to CPU; moved to correct device in _compute_rank_predictions.
+        """
+        anchors = torch.load(path, map_location="cpu")
+        logger.info(f"Loaded {len(anchors)} class anchors from {path}")
+        return anchors
 
     # ================================================================
     #  Model IO

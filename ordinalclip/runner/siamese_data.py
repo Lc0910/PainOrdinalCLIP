@@ -232,6 +232,11 @@ class SiameseDataModule(pl.LightningDataModule):
         self.train_dataloder_cfg = train_dataloder_cfg
         self.eval_dataloder_cfg = eval_dataloder_cfg
 
+        # Store references for anchor computation (single-image train loader)
+        self._train_images_root = train_images_root
+        self._train_data_file = train_data_file
+        self._eval_transforms = eval_transforms
+
     def train_dataloader(self):
         return DataLoader(dataset=self.train_set, **self.train_dataloder_cfg)
 
@@ -240,3 +245,19 @@ class SiameseDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(dataset=self.test_set, **self.eval_dataloder_cfg)
+
+    def anchor_dataloader(self) -> DataLoader:
+        """Single-image DataLoader from training data with eval transforms.
+
+        Used for computing per-class feature centroids (anchors) for
+        anchor-based ranking inference. Uses eval transforms (no augmentation)
+        so extracted features are deterministic.
+        """
+        from .data import RegressionDataset
+
+        anchor_set = RegressionDataset(
+            self._train_images_root,
+            self._train_data_file,
+            self._eval_transforms,
+        )
+        return DataLoader(dataset=anchor_set, **self.eval_dataloder_cfg)
