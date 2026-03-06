@@ -179,8 +179,8 @@ class SiameseRunner(pl.LightningModule):
     def training_epoch_end(self, outputs) -> None:
         """Epoch-level pairwise AUC."""
         if self._train_ranking_scores:
-            all_scores = torch.cat(self._train_ranking_scores)   # [N]
-            all_labels = torch.cat(self._train_ranking_labels)   # [N]
+            all_scores = torch.cat(self._train_ranking_scores).float()  # [N]
+            all_labels = torch.cat(self._train_ranking_labels).float()  # [N]
             # Convert signed scores to probabilities for AUC
             probs = torch.sigmoid(all_scores)
             auc = self._compute_binary_auc(probs, all_labels)
