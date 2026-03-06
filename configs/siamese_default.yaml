@@ -1,10 +1,19 @@
 # ==============================================================================
-# Siamese Stage 2 Default Config
+# Siamese Stage 2 Default Config — aligned to Fabio (2025) dissertation §5.3
 # ==============================================================================
-# Joint loss (P0-1): ranking BCE + CE_a + CE_b
-# Pair sampling (P0-2): cross-subject constraints in siamese_data.py
-# Head type (P1-2): mlp (default) or linear via ranking_head_cfg.head_type
-# Ranking metrics (P1-3): pairwise acc + AUC logged during training
+#
+# Architecture:
+#   OrdinalCLIP backbone (frozen) → SharedMLP (D→256→128)
+#                                      ↓
+#                               RegressionHead    ConcatRankingHead
+#                               128→1→sigmoid     [ei ∥ ej] (256)→1
+#                               ŷ ∈ (0, K-1)     s_ij (signed score)
+#
+# Training loss (§5.1.1.2):
+#   L = mse_loss * L_mse + ranking_loss * L_hinge
+#   L_mse   = MSE(ŷ_a, y_a) + MSE(ŷ_b, y_b)
+#   L_hinge = mean max(0, |y_a-y_b|·margin_scale − η·s_ab)
+#
 # ==============================================================================
 
 runner_cfg:
@@ -17,7 +26,7 @@ runner_cfg:
     prompt_learner_cfg:
       type: PlainPromptLearner
       num_ranks: 2
-      num_base_ranks: 3
+      num_base_ranks: 3       # ignored for PlainPromptLearner, only used by RankPromptLearner
       num_tokens_per_rank: 1
       num_context_tokens: 10
       rank_tokens_position: tail
@@ -28,29 +37,39 @@ runner_cfg:
     text_encoder_name: ViT-B/16
     image_encoder_name: ViT-B/16
 
-  # --- Ranking Head ---
+  # --- SharedMLP (Fabio §5.3.1) ---
+  # Projects backbone features (D) into compact embedding (out_dims).
+  # Both RegressionHead and ConcatRankingHead share this embedding.
+  shared_mlp_cfg:
+    hidden_dims: 256       # D → hidden_dims
+    out_dims: 128          # hidden_dims → out_dims (e)
+    dropout: 0.0           # optional dropout between layers
+
+  # --- Concat Ranking Head (Fabio §5.3.1) ---
+  # Receives [ei ∥ ej] (2*out_dims) → signed ranking score s_ij.
+  # "linear" = paper default; "mlp" = higher-capacity variant.
   ranking_head_cfg:
-    head_type: mlp         # "mlp" or "linear" (P1-2)
-    hidden_dims: 512
-    dropout: 0.3
+    head_type: linear      # "linear" (paper default) or "mlp"
+    hidden_dims: 256       # only used when head_type="mlp"
+    dropout: 0.0           # only used when head_type="mlp"
 
   freeze_backbone: true
 
-  # --- Joint Loss Weights (P0-1) ---
+  # --- Joint Loss Weights (Fabio §5.1.1.2) ---
   loss_weights:
-    ranking_loss: 1.0
-    ce_loss_a: 0.5
-    ce_loss_b: 0.5
+    mse_loss: 1.0          # weight on MSE regression loss
+    ranking_loss: 0.5      # λ: weight on adaptive hinge ranking loss
+    margin_scale: 1.0      # adaptive margin = |yi - yj| * margin_scale
 
-  # --- Optimizer & Scheduler ---
+  # --- Optimizer & Scheduler (Fabio §5.3: AdamW + CosineAnnealing) ---
   optimizer_and_scheduler_cfg:
     param_dict_cfg:
-      lr_ranking_head: 1.0e-03
-      lr_backbone: 0.0              # 0 = frozen
+      lr_siamese_heads: 1.0e-04   # LR for SharedMLP + RegressionHead + RankingHead
+      lr_backbone: 0.0            # 0 = frozen
     optimizer_cfg:
-      optimizer_name: adam
-      lr: 1.0e-03
-      weight_decay: 1.0e-04
+      optimizer_name: adamw       # AdamW: decoupled weight decay (Fabio §5.3)
+      lr: 1.0e-04
+      weight_decay: 1.0e-02       # Fabio default; stronger regularization than Adam
       momentum: 0.9
       sgd_dampening: 0.0
       sgd_nesterov: false
@@ -60,16 +79,23 @@ runner_cfg:
       staged_lr: null
       lookahead: false
     lr_scheduler_cfg:
-      lr_scheduler_name: multi_step
-      stepsize:
+      lr_scheduler_name: cosine   # CosineAnnealing: smooth LR decay (Fabio §5.3)
+      stepsize:                   # (unused for cosine, kept for multi_step compat)
         - 30
-      gamma: 0.1
-      max_epochs: &max_epochs 50
+      gamma: 0.1                  # (unused for cosine)
+      max_epochs: &max_epochs 100 # Fabio default; EarlyStopping prevents overfitting
       warmup_epoch: 5
       warmup_cons_lr: 1.0e-05
       warmup_min_lr: 1.0e-05
       warmup_type: constant
       warmup_recount: true
+
+  # --- EarlyStopping ---
+  early_stopping_cfg:
+    enabled: true
+    patience: 15                  # Fabio default; stop if val MAE stalls 15 epochs
+    monitor: val_mae_max_metric
+    mode: min
 
   # --- Stage 1 Checkpoint ---
   load_weights_cfg:

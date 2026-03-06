@@ -1,13 +1,15 @@
-"""Unit tests for Siamese ranking head system.
+"""Unit tests for Siamese ranking system — aligned to Fabio (2025) §5.3.
 
 Tests:
   1. PairwiseDataset pair label correctness
   2. PairwiseDataset cross-subject constraint
-  3. SiameseOrdinalCLIP forward shape
+  3. SiameseOrdinalCLIP forward shape (new architecture)
   4. SiameseOrdinalCLIP freeze/unfreeze gradient flow
   5. SiameseRunner construction and training_step
   6. AUC computation correctness
-  7. Linear vs MLP head shapes
+  7. New head components: SharedMLP, RegressionHead, ConcatRankingHead
+  8. Config parsing
+  9. Multi-class anchor-based ranking inference
 """
 import os.path as osp
 
@@ -17,10 +19,10 @@ from omegaconf import OmegaConf
 
 from ordinalclip.models import MODELS
 from ordinalclip.models.siamese_ordinalclip import (
-    LinearRankingHead,
-    MLPRankingHead,
+    ConcatRankingHead,
+    RegressionHead,
+    SharedMLP,
     SiameseOrdinalCLIP,
-    build_ranking_head,
 )
 from ordinalclip.runner.siamese_runner import SiameseRunner
 
@@ -36,10 +38,21 @@ def siamese_cfg():
 
 @pytest.fixture
 def dummy_backbone():
-    """Build a small backbone for testing."""
+    """Build a small backbone for testing (RN50)."""
     cfg = OmegaConf.load(osp.join(osp.dirname(__file__), "data", "siamese_default.yaml"))
     backbone_cfg = OmegaConf.to_container(cfg.runner_cfg.backbone_cfg)
     return MODELS.build(backbone_cfg)
+
+
+@pytest.fixture
+def dummy_siamese_model(dummy_backbone):
+    """Build a SiameseOrdinalCLIP with small hidden dims for testing."""
+    return SiameseOrdinalCLIP(
+        backbone=dummy_backbone,
+        shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+        ranking_head_cfg={"head_type": "linear"},
+        freeze_backbone=True,
+    )
 
 
 @pytest.fixture
@@ -168,15 +181,16 @@ class TestPairSampling:
 
 
 # ================================================================
-#  3. Model Forward Shape
+#  3. Model Forward Shape (new architecture)
 # ================================================================
 
 class TestSiameseModel:
     def test_forward_pair(self, dummy_backbone):
-        """Test pairwise forward produces correct shapes."""
+        """Pairwise forward returns (ranking_logit [B,1], reg_a [B], reg_b [B])."""
         model = SiameseOrdinalCLIP(
             backbone=dummy_backbone,
-            ranking_head_cfg={"head_type": "mlp", "embed_dims": dummy_backbone.embed_dims, "hidden_dims": 64},
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "linear"},
             freeze_backbone=True,
         )
         B = 2
@@ -184,27 +198,75 @@ class TestSiameseModel:
         img_a = torch.randn(B, 3, res, res)
         img_b = torch.randn(B, 3, res, res)
 
-        ranking_logits, logits_a, logits_b = model(img_a, img_b)
+        ranking_logit, reg_score_a, reg_score_b = model(img_a, img_b)
 
-        assert ranking_logits.shape == (B, 1), f"Expected [B,1], got {ranking_logits.shape}"
-        assert logits_a.shape == (B, dummy_backbone.num_ranks), \
-            f"Expected [B,{dummy_backbone.num_ranks}], got {logits_a.shape}"
-        assert logits_b.shape == logits_a.shape
+        assert ranking_logit.shape == (B, 1), \
+            f"Expected [B,1], got {ranking_logit.shape}"
+        assert reg_score_a.shape == (B,), \
+            f"Expected [B], got {reg_score_a.shape}"
+        assert reg_score_b.shape == (B,), \
+            f"Expected [B], got {reg_score_b.shape}"
 
-    def test_forward_single(self, dummy_backbone):
-        """Test single-image forward for val/test."""
+    def test_forward_pair_mlp_head(self, dummy_backbone):
+        """MLP ranking head also produces correct output shapes."""
         model = SiameseOrdinalCLIP(
             backbone=dummy_backbone,
-            ranking_head_cfg={"head_type": "mlp", "embed_dims": dummy_backbone.embed_dims, "hidden_dims": 64},
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "mlp", "hidden_dims": 64},
+            freeze_backbone=True,
+        )
+        B = 3
+        res = dummy_backbone.image_encoder.input_resolution
+        img_a = torch.randn(B, 3, res, res)
+        img_b = torch.randn(B, 3, res, res)
+
+        ranking_logit, reg_score_a, reg_score_b = model(img_a, img_b)
+        assert ranking_logit.shape == (B, 1)
+        assert reg_score_a.shape == (B,)
+
+    def test_forward_single(self, dummy_backbone):
+        """Single-image forward returns (logits [B,K], feat [B,D], reg_score [B])."""
+        model = SiameseOrdinalCLIP(
+            backbone=dummy_backbone,
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "linear"},
             freeze_backbone=True,
         )
         B = 2
         res = dummy_backbone.image_encoder.input_resolution
         img = torch.randn(B, 3, res, res)
 
-        logits, feat, _ = model.forward_single(img)
+        logits, feat, reg_score = model.forward_single(img)
 
-        assert logits.shape == (B, dummy_backbone.num_ranks)
+        assert logits.shape == (B, dummy_backbone.num_ranks), \
+            f"Expected [B,K], got {logits.shape}"
+        assert feat.shape == (B, dummy_backbone.embed_dims), \
+            f"Expected [B,D], got {feat.shape}"
+        assert reg_score.shape == (B,), \
+            f"Expected [B], got {reg_score.shape}"
+
+    def test_regression_score_range(self, dummy_backbone):
+        """Regression scores should be in (0, K-1) due to sigmoid rescaling.
+
+        Uses B=100 samples to reduce risk of hitting sigmoid saturation
+        boundaries with randomly initialized weights.
+        """
+        K = dummy_backbone.num_ranks
+        model = SiameseOrdinalCLIP(
+            backbone=dummy_backbone,
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "linear"},
+            freeze_backbone=True,
+        )
+        B = 100
+        res = dummy_backbone.image_encoder.input_resolution
+        imgs = torch.randn(B, 3, res, res)
+
+        _, _, reg_score = model.forward_single(imgs)
+
+        assert (reg_score > 0).all(), f"reg_score should be > 0, got min={reg_score.min()}"
+        assert (reg_score < K - 1).all(), \
+            f"reg_score should be < {K-1}, got max={reg_score.max()}"
 
 
 # ================================================================
@@ -213,28 +275,33 @@ class TestSiameseModel:
 
 class TestGradientFlow:
     def test_backbone_frozen(self, dummy_backbone):
-        """When backbone is frozen, only ranking_head should have gradients."""
+        """When backbone is frozen, only siamese heads should have gradients."""
         model = SiameseOrdinalCLIP(
             backbone=dummy_backbone,
-            ranking_head_cfg={"head_type": "mlp", "embed_dims": dummy_backbone.embed_dims, "hidden_dims": 64},
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "linear"},
             freeze_backbone=True,
         )
         # Backbone: all requires_grad should be False
         for name, param in model.backbone.named_parameters():
             assert not param.requires_grad, f"Backbone param {name} should be frozen"
 
-        # Ranking head: all requires_grad should be True
+        # SharedMLP, RegressionHead, RankingHead: all requires_grad should be True
+        for name, param in model.shared_mlp.named_parameters():
+            assert param.requires_grad, f"SharedMLP param {name} should be trainable"
+        for name, param in model.regression_head.named_parameters():
+            assert param.requires_grad, f"RegressionHead param {name} should be trainable"
         for name, param in model.ranking_head.named_parameters():
-            assert param.requires_grad, f"Ranking head param {name} should be trainable"
+            assert param.requires_grad, f"RankingHead param {name} should be trainable"
 
     def test_backbone_unfrozen(self, dummy_backbone):
         """When backbone is not frozen, all params should have gradients."""
         model = SiameseOrdinalCLIP(
             backbone=dummy_backbone,
-            ranking_head_cfg={"head_type": "mlp", "embed_dims": dummy_backbone.embed_dims, "hidden_dims": 64},
+            shared_mlp_cfg={"hidden_dims": 64, "out_dims": 64},
+            ranking_head_cfg={"head_type": "linear"},
             freeze_backbone=False,
         )
-        # All params should be trainable
         for name, param in model.named_parameters():
             assert param.requires_grad, f"Param {name} should be trainable"
 
@@ -249,20 +316,22 @@ class TestSiameseRunner:
         runner = SiameseRunner(**OmegaConf.to_container(siamese_cfg.runner_cfg))
         assert runner.num_ranks == 2
         assert isinstance(runner.module, SiameseOrdinalCLIP)
+        # Verify new sub-modules exist
+        assert hasattr(runner.module, "shared_mlp")
+        assert hasattr(runner.module, "regression_head")
+        assert hasattr(runner.module, "ranking_head")
 
     def test_init_order_logger_before_load(self, siamese_cfg):
         """_custom_logger must be initialized before _load_backbone_weights is called.
 
-        Regression test for P0-1: _custom_logger was used before definition.
+        Regression test: _custom_logger was used before definition.
         """
         runner = SiameseRunner(**OmegaConf.to_container(siamese_cfg.runner_cfg))
-        # If init order is wrong, construction would raise AttributeError.
-        # Verify the logger exists and is usable.
         assert hasattr(runner, "_custom_logger")
         assert runner._custom_logger is not None
 
     def test_training_step_shape(self, siamese_cfg):
-        """Verify training_step accepts batch and returns loss."""
+        """Verify training_step accepts batch and returns loss dict."""
         runner = SiameseRunner(**OmegaConf.to_container(siamese_cfg.runner_cfg))
         B = 2
         res = runner.module.backbone.image_encoder.input_resolution
@@ -270,22 +339,38 @@ class TestSiameseRunner:
         batch = (
             torch.randn(B, 3, res, res),   # img_a
             torch.randn(B, 3, res, res),   # img_b
-            torch.tensor([1, 0]),           # pair_label
-            torch.tensor([1, 0]),           # rank_a
-            torch.tensor([0, 1]),           # rank_b
+            torch.tensor([1, 0]),           # pair_label (1 if rank_a > rank_b)
+            torch.tensor([1, 0]),           # rank_a (integer labels)
+            torch.tensor([0, 1]),           # rank_b (integer labels)
         )
         outputs = runner.training_step(batch, batch_idx=0)
         assert "loss" in outputs
         assert outputs["loss"].requires_grad
 
+    def test_training_step_loss_components(self, siamese_cfg):
+        """Training step should produce finite MSE + hinge losses."""
+        runner = SiameseRunner(**OmegaConf.to_container(siamese_cfg.runner_cfg))
+        B = 4
+        res = runner.module.backbone.image_encoder.input_resolution
+
+        batch = (
+            torch.randn(B, 3, res, res),
+            torch.randn(B, 3, res, res),
+            torch.tensor([1, 0, 1, 0]),
+            torch.tensor([1, 0, 1, 0]),
+            torch.tensor([0, 1, 0, 1]),
+        )
+        outputs = runner.training_step(batch, batch_idx=0)
+        assert torch.isfinite(outputs["loss"]), "Loss should be finite"
+
     def test_empty_param_raises(self, siamese_cfg):
         """Both lr=0 should raise ValueError."""
         cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
-        cfg["optimizer_and_scheduler_cfg"]["param_dict_cfg"]["lr_ranking_head"] = 0.0
+        cfg["optimizer_and_scheduler_cfg"]["param_dict_cfg"]["lr_siamese_heads"] = 0.0
         cfg["optimizer_and_scheduler_cfg"]["param_dict_cfg"]["lr_backbone"] = 0.0
         runner = SiameseRunner(**cfg)
         with pytest.raises(ValueError, match="No trainable parameters"):
-            runner.build_param_dict(lr_ranking_head=0.0, lr_backbone=0.0)
+            runner.build_param_dict(lr_siamese_heads=0.0, lr_backbone=0.0)
 
 
 # ================================================================
@@ -324,40 +409,105 @@ class TestAUC:
 
 
 # ================================================================
-#  7. Ranking Head Variants (P1-2)
+#  7. New Head Components: SharedMLP, RegressionHead, ConcatRankingHead
 # ================================================================
 
-class TestRankingHeads:
-    def test_linear_head_shape(self):
-        """LinearRankingHead: D->1."""
-        head = LinearRankingHead(embed_dims=512)
+class TestHeadComponents:
+    """Tests for the three new modules in the Fabio §5.3 architecture."""
+
+    # --- SharedMLP ---
+
+    def test_shared_mlp_output_shape(self):
+        """SharedMLP: D → hidden → out_dims."""
+        mlp = SharedMLP(embed_dims=512, hidden_dims=256, out_dims=128)
         x = torch.randn(4, 512)  # [B, D]
-        out = head(x)
-        assert out.shape == (4, 1)
+        out = mlp(x)
+        assert out.shape == (4, 128), f"Expected [4, 128], got {out.shape}"
 
-    def test_mlp_head_shape(self):
-        """MLPRankingHead: D->hidden->hidden//2->1."""
-        head = MLPRankingHead(embed_dims=512, hidden_dims=256, dropout=0.1)
-        x = torch.randn(4, 512)  # [B, D]
-        out = head(x)
-        assert out.shape == (4, 1)
+    def test_shared_mlp_out_dims_attr(self):
+        """SharedMLP.out_dims is accessible for downstream modules."""
+        mlp = SharedMLP(embed_dims=1024, hidden_dims=256, out_dims=64)
+        assert mlp.out_dims == 64
 
-    def test_build_ranking_head_factory(self):
-        """build_ranking_head should create correct head type."""
-        linear = build_ranking_head(head_type="linear", embed_dims=256)
-        assert isinstance(linear, LinearRankingHead)
+    def test_shared_mlp_with_dropout(self):
+        """SharedMLP with dropout should still produce correct output shape."""
+        mlp = SharedMLP(embed_dims=256, hidden_dims=128, out_dims=64, dropout=0.3)
+        mlp.eval()
+        x = torch.randn(8, 256)
+        out = mlp(x)
+        assert out.shape == (8, 64)
 
-        mlp = build_ranking_head(head_type="mlp", embed_dims=256, hidden_dims=128)
-        assert isinstance(mlp, MLPRankingHead)
+    # --- RegressionHead ---
 
-    def test_unknown_head_type(self):
+    def test_regression_head_shape(self):
+        """RegressionHead: in_dims → [B] scalar score."""
+        head = RegressionHead(in_dims=128, num_ranks=5)
+        e = torch.randn(4, 128)  # [B, out_dims]
+        score = head(e)
+        assert score.shape == (4,), f"Expected [4], got {score.shape}"
+
+    def test_regression_head_range_2class(self):
+        """For 2-class, score should be in (0, 1)."""
+        head = RegressionHead(in_dims=64, num_ranks=2)
+        e = torch.randn(100, 64)
+        score = head(e)
+        # sigmoid-based: strictly between 0 and K-1
+        assert (score > 0).all(), "Score should be > 0"
+        assert (score < 1).all(), "Score should be < 1 for K=2"
+
+    def test_regression_head_range_5class(self):
+        """For 5-class (K=5), score should be in (0, 4)."""
+        head = RegressionHead(in_dims=128, num_ranks=5)
+        e = torch.randn(100, 128)
+        score = head(e)
+        assert (score > 0).all(), "Score should be > 0"
+        assert (score < 4).all(), "Score should be < 4 for K=5"
+
+    # --- ConcatRankingHead ---
+
+    def test_concat_head_linear_shape(self):
+        """Linear ConcatRankingHead: 2*in_dims → 1."""
+        head = ConcatRankingHead(in_dims=128, head_type="linear")
+        concat_feat = torch.randn(4, 256)  # [B, 2*in_dims]
+        out = head(concat_feat)
+        assert out.shape == (4, 1), f"Expected [4, 1], got {out.shape}"
+
+    def test_concat_head_mlp_shape(self):
+        """MLP ConcatRankingHead: 2*in_dims → hidden → hidden//2 → 1."""
+        head = ConcatRankingHead(in_dims=128, head_type="mlp", hidden_dims=256)
+        concat_feat = torch.randn(4, 256)
+        out = head(concat_feat)
+        assert out.shape == (4, 1), f"Expected [4, 1], got {out.shape}"
+
+    def test_concat_head_mlp_with_dropout(self):
+        """MLP ConcatRankingHead with dropout."""
+        head = ConcatRankingHead(in_dims=64, head_type="mlp", hidden_dims=128, dropout=0.1)
+        head.eval()
+        concat_feat = torch.randn(8, 128)
+        out = head(concat_feat)
+        assert out.shape == (8, 1)
+
+    def test_concat_head_unknown_type_raises(self):
         """Unknown head_type should raise ValueError."""
         with pytest.raises(ValueError, match="Unknown head_type"):
-            build_ranking_head(head_type="transformer", embed_dims=256)
+            ConcatRankingHead(in_dims=128, head_type="transformer")
+
+    def test_concat_head_pair_asymmetry(self):
+        """Swapping ei and ej should produce a different score (order matters)."""
+        head = ConcatRankingHead(in_dims=64, head_type="linear")
+        head.eval()
+        e_i = torch.randn(1, 64)
+        e_j = torch.randn(1, 64)
+        s_ij = head(torch.cat([e_i, e_j], dim=-1))
+        s_ji = head(torch.cat([e_j, e_i], dim=-1))
+        # For a linear layer, s_ij + s_ji = 2*bias (not necessarily 0),
+        # so true antisymmetry doesn't hold. Verify scores are different
+        # to confirm the head is order-sensitive.
+        assert s_ij.item() != s_ji.item(), "Swapping pair should change score"
 
 
 # ================================================================
-#  8. Config Parsing (P0-3 regression test)
+#  8. Config Parsing (regression test for --cfg_options)
 # ================================================================
 
 class TestConfigParsing:
@@ -389,22 +539,26 @@ class TestConfigParsing:
             "      interpolation_type: linear\n"
             "    text_encoder_name: RN50\n"
             "    image_encoder_name: RN50\n"
-            "  ranking_head_cfg:\n"
-            "    head_type: mlp\n"
+            "  shared_mlp_cfg:\n"
             "    hidden_dims: 64\n"
-            "    dropout: 0.1\n"
+            "    out_dims: 64\n"
+            "    dropout: 0.0\n"
+            "  ranking_head_cfg:\n"
+            "    head_type: linear\n"
+            "    hidden_dims: 64\n"
+            "    dropout: 0.0\n"
             "  freeze_backbone: true\n"
             "  loss_weights:\n"
-            "    ranking_loss: 1.0\n"
-            "    ce_loss_a: 0.5\n"
-            "    ce_loss_b: 0.5\n"
+            "    mse_loss: 1.0\n"
+            "    ranking_loss: 0.5\n"
+            "    margin_scale: 1.0\n"
             "  optimizer_and_scheduler_cfg:\n"
             "    param_dict_cfg:\n"
-            "      lr_ranking_head: 0.001\n"
+            "      lr_siamese_heads: 0.0001\n"
             "      lr_backbone: 0.0\n"
             "    optimizer_cfg:\n"
             "      optimizer_name: adam\n"
-            "      lr: 0.001\n"
+            "      lr: 0.0001\n"
             "      weight_decay: 0.0\n"
             "      momentum: 0.9\n"
             "      sgd_dampening: 0.0\n"
@@ -435,8 +589,7 @@ class TestConfigParsing:
             "test_only: false\n"
         )
 
-        # Simulate: base options + experiment-specific options in a single
-        # --cfg_options list (as the fixed shell script now does).
+        # Simulate multiple --cfg_options in a single list (fixed shell script format)
         args = argparse.Namespace(
             config=[str(cfg_file)],
             seed=None,
@@ -455,3 +608,175 @@ class TestConfigParsing:
         assert cfg.trainer_cfg.max_epochs == 30
         assert cfg.runner_cfg.loss_weights.ranking_loss == 2.0
         assert cfg.runner_cfg.ranking_head_cfg.head_type == "linear"
+
+
+# ================================================================
+#  9. Multi-Class Anchor-Based Ranking Inference
+# ================================================================
+
+class TestMultiClassAnchorInference:
+    """Test cumulative link approach for multi-class rank predictions.
+
+    Anchors are stored in SharedMLP embedding space (out_dims), NOT raw CLIP
+    feature space (embed_dims). Tests use out_dims = 64 (from test fixture).
+    """
+
+    def _make_runner_with_anchors(self, siamese_cfg, num_ranks: int, anchors: dict):
+        """Helper: build a SiameseRunner and inject pre-computed anchors."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = num_ranks
+        cfg["anchor_inference_cfg"] = {"enabled": True, "ensemble_alpha": 0.5}
+        runner = SiameseRunner(**cfg)
+        runner._anchors = anchors
+        return runner
+
+    def _get_embed_and_out_dims(self, runner: SiameseRunner):
+        """Return (embed_dims, out_dims) for anchor / feature sizing."""
+        embed_dims = runner.module.backbone.embed_dims
+        out_dims = runner.module.shared_mlp.out_dims
+        return embed_dims, out_dims
+
+    def test_binary_fallback(self, siamese_cfg):
+        """2-class should use the binary path (not cumulative link)."""
+        embed_dims = MODELS.build(
+            OmegaConf.to_container(siamese_cfg.runner_cfg.backbone_cfg)
+        ).embed_dims
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        runner = SiameseRunner(**cfg)
+        out_dims = runner.module.shared_mlp.out_dims
+
+        runner._anchors = {
+            0: torch.randn(out_dims),
+            1: torch.randn(out_dims),
+        }
+
+        B = 2
+        image_features = torch.randn(B, embed_dims)
+        y = torch.tensor([0, 1])
+
+        result = runner._compute_rank_predictions(image_features, y)
+        assert result["_p_rank"].shape == (B, 2), \
+            f"Expected [B,2], got {result['_p_rank'].shape}"
+        assert result["predict_y_rank"].shape == (B,)
+
+    def test_5class_cumulative_link_shape(self, siamese_cfg):
+        """5-class cumulative link should produce [B, 5] probability distribution."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = 5
+        cfg["anchor_inference_cfg"] = {"enabled": True}
+        runner = SiameseRunner(**cfg)
+
+        embed_dims, out_dims = self._get_embed_and_out_dims(runner)
+        runner._anchors = {k: torch.randn(out_dims) for k in range(5)}
+
+        B = 4
+        image_features = torch.randn(B, embed_dims)
+        y = torch.tensor([0, 1, 3, 4])
+
+        result = runner._compute_rank_predictions(image_features, y)
+        assert result["_p_rank"].shape == (B, 5), \
+            f"Expected [B,5], got {result['_p_rank'].shape}"
+        assert result["predict_y_rank"].shape == (B,)
+        assert result["mae_rank_metric"].shape == (B,)
+        assert result["acc_rank_metric"].shape == (B,)
+
+    def test_5class_probabilities_sum_to_one(self, siamese_cfg):
+        """Cumulative link probabilities should sum to 1 after normalization."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = 5
+        cfg["anchor_inference_cfg"] = {"enabled": True}
+        runner = SiameseRunner(**cfg)
+
+        embed_dims, out_dims = self._get_embed_and_out_dims(runner)
+        runner._anchors = {k: torch.randn(out_dims) for k in range(5)}
+
+        B = 8
+        image_features = torch.randn(B, embed_dims)
+        y = torch.randint(0, 5, (B,))
+
+        result = runner._compute_rank_predictions(image_features, y)
+        p_rank = result["_p_rank"]  # [B, 5]
+
+        # All probabilities non-negative
+        assert (p_rank >= 0).all(), "Probabilities should be non-negative"
+        # Each row sums to ~1.0
+        row_sums = p_rank.sum(dim=1)
+        assert torch.allclose(row_sums, torch.ones(B), atol=1e-5), \
+            f"Probabilities should sum to 1, got {row_sums}"
+
+    def test_5class_prediction_range(self, siamese_cfg):
+        """Predictions should be in [0, K-1] range."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = 5
+        cfg["anchor_inference_cfg"] = {"enabled": True}
+        runner = SiameseRunner(**cfg)
+
+        embed_dims, out_dims = self._get_embed_and_out_dims(runner)
+        runner._anchors = {k: torch.randn(out_dims) for k in range(5)}
+
+        B = 16
+        image_features = torch.randn(B, embed_dims)
+        y = torch.randint(0, 5, (B,))
+
+        result = runner._compute_rank_predictions(image_features, y)
+        pred = result["predict_y_rank"]  # [B]
+
+        assert (pred >= 0).all(), f"Predictions should be >= 0, min={pred.min()}"
+        assert (pred <= 4).all(), f"Predictions should be <= 4, max={pred.max()}"
+
+    def test_3class_cumulative_link(self, siamese_cfg):
+        """3-class should also work with cumulative link."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = 3
+        cfg["anchor_inference_cfg"] = {"enabled": True}
+        runner = SiameseRunner(**cfg)
+
+        embed_dims, out_dims = self._get_embed_and_out_dims(runner)
+        runner._anchors = {k: torch.randn(out_dims) for k in range(3)}
+
+        B = 4
+        image_features = torch.randn(B, embed_dims)
+        y = torch.tensor([0, 1, 2, 1])
+
+        result = runner._compute_rank_predictions(image_features, y)
+        assert result["_p_rank"].shape == (B, 3)
+
+        row_sums = result["_p_rank"].sum(dim=1)
+        assert torch.allclose(row_sums, torch.ones(B), atol=1e-5)
+
+    def test_ensemble_with_multiclass(self, siamese_cfg):
+        """Ensemble should work for multi-class rank + cls predictions."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["backbone_cfg"]["prompt_learner_cfg"]["num_ranks"] = 5
+        cfg["anchor_inference_cfg"] = {"enabled": True, "ensemble_alpha": 0.5}
+        runner = SiameseRunner(**cfg)
+
+        B, K = 4, 5
+        p_cls  = torch.softmax(torch.randn(B, K), dim=-1)   # [B, 5]
+        p_rank = torch.softmax(torch.randn(B, K), dim=-1)   # [B, 5]
+        y = torch.tensor([0, 2, 3, 4])
+
+        result = runner._compute_ensemble_predictions(p_cls, p_rank, y)
+        assert result["predict_y_ens"].shape == (B,)
+        assert result["mae_ens_metric"].shape == (B,)
+        assert result["acc_ens_metric"].shape == (B,)
+
+    def test_anchor_mode_dual(self, siamese_cfg):
+        """Dual anchor mode should compute score from both anchors."""
+        cfg = OmegaConf.to_container(siamese_cfg.runner_cfg)
+        cfg["anchor_inference_cfg"] = {"enabled": True, "anchor_mode": "dual", "ensemble_alpha": 0.5}
+        runner = SiameseRunner(**cfg)
+
+        embed_dims, out_dims = self._get_embed_and_out_dims(runner)
+        runner._anchors = {
+            0: torch.randn(out_dims),
+            1: torch.randn(out_dims),
+        }
+
+        B = 3
+        image_features = torch.randn(B, embed_dims)
+        y = torch.tensor([0, 1, 0])
+
+        result = runner._compute_rank_predictions(image_features, y)
+        assert result["_p_rank"].shape == (B, 2)
+        assert result["predict_y_rank"].shape == (B,)

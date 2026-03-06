@@ -8,13 +8,16 @@ Usage:
 
 Same CLI interface as scripts/run.py but uses SiameseRunner + SiameseDataModule.
 """
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 from ordinalclip.runner.siamese_data import SiameseDataModule
 from ordinalclip.runner.siamese_runner import SiameseRunner
@@ -28,7 +31,10 @@ def main(cfg: DictConfig) -> None:
     output_dir = Path(cfg.runner_cfg.output_dir)
     setup_file_handle_for_all_logger(str(output_dir / "run.log"))
 
-    callbacks = load_callbacks(output_dir)
+    early_stopping_cfg = OmegaConf.to_container(
+        cfg.runner_cfg.get("early_stopping_cfg", OmegaConf.create({"enabled": False}))
+    )
+    callbacks = load_callbacks(output_dir, early_stopping_cfg=early_stopping_cfg)
     loggers = load_loggers(output_dir)
 
     deterministic = True
@@ -46,7 +52,9 @@ def main(cfg: DictConfig) -> None:
 
     # Training
     if not cfg.test_only:
-        runner = SiameseRunner(**OmegaConf.to_container(cfg.runner_cfg))
+        runner_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+        runner_kwargs.pop("early_stopping_cfg", None)  # handled by Trainer callback
+        runner = SiameseRunner(**runner_kwargs)
 
         logger.info("Start Siamese Stage 2 training.")
         trainer.fit(model=runner, datamodule=datamodule)
@@ -70,6 +78,7 @@ def main(cfg: DictConfig) -> None:
             )
         logger.info(f"Test-only with external checkpoint: {ext_ckpt_path}")
         runner_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+        runner_kwargs.pop("early_stopping_cfg", None)
         # Clear backbone loading — full weights come from PL checkpoint
         for k in runner_kwargs.get("load_weights_cfg", {}):
             runner_kwargs["load_weights_cfg"][k] = None
@@ -85,7 +94,9 @@ def main(cfg: DictConfig) -> None:
     if len(ckpt_paths) == 0:
         logger.info("No checkpoints found — running zero-shot test.")
         if runner is None:
-            runner = SiameseRunner(**OmegaConf.to_container(cfg.runner_cfg))
+            zero_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+            zero_kwargs.pop("early_stopping_cfg", None)
+            runner = SiameseRunner(**zero_kwargs)
         trainer.test(model=runner, datamodule=datamodule)
         logger.info("End zero-shot test.")
 
@@ -94,6 +105,7 @@ def main(cfg: DictConfig) -> None:
 
         # Work on a copy to avoid mutating OmegaConf struct
         runner_kwargs = OmegaConf.to_container(cfg.runner_cfg)
+        runner_kwargs.pop("early_stopping_cfg", None)
         # Clear backbone loading — weights come from PL checkpoint
         for k in runner_kwargs.get("load_weights_cfg", {}):
             runner_kwargs["load_weights_cfg"][k] = None
@@ -118,10 +130,10 @@ def load_loggers(output_dir: Path):
     ]
 
 
-def load_callbacks(output_dir: Path):
+def load_callbacks(output_dir: Path, early_stopping_cfg: Optional[dict] = None):
     output_dir.mkdir(exist_ok=True, parents=True)
     (output_dir / "ckpts").mkdir(exist_ok=True, parents=True)
-    return [
+    callbacks = [
         ModelCheckpoint(
             monitor="val_mae_max_metric",
             dirpath=str(output_dir / "ckpts"),
@@ -133,6 +145,22 @@ def load_callbacks(output_dir: Path):
             save_weights_only=True,
         ),
     ]
+
+    # EarlyStopping (Fabio §5.3: patience=15)
+    if early_stopping_cfg and early_stopping_cfg.get("enabled", False):
+        es = EarlyStopping(
+            monitor=early_stopping_cfg.get("monitor", "val_mae_max_metric"),
+            patience=early_stopping_cfg.get("patience", 15),
+            mode=early_stopping_cfg.get("mode", "min"),
+            verbose=True,
+        )
+        callbacks.append(es)
+        logger.info(
+            f"EarlyStopping enabled: monitor={es.monitor}, "
+            f"patience={es.patience}, mode={es.mode}"
+        )
+
+    return callbacks
 
 
 def setup_output_dir_for_training(output_dir: Path) -> Path:
