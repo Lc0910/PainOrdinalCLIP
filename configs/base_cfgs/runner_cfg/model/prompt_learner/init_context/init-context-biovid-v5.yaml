@@ -1,0 +1,7 @@
+# BioVid v5: CLIP-aligned visual description
+# Construct: "a photo of a person experiencing [rank]"
+# Designed for natural CLIP text-image alignment with pain rank tokens.
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      init_context: "a photo of a person experiencing"
