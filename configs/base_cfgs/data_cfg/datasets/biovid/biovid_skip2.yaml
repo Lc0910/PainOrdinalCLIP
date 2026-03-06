@@ -1,0 +1,12 @@
+# BioVid 5-class data config — skip first 2 frames per video (Stage 1)
+data_cfg:
+  train_images_root: data/biovid
+  val_images_root: data/biovid
+  test_images_root: data/biovid
+  train_data_file: data/biovid/train_skip2.txt
+  val_data_file: data/biovid/test_skip2.txt
+  test_data_file: data/biovid/test_skip2.txt
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      num_ranks: 5
