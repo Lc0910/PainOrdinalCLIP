@@ -68,7 +68,7 @@ runner_cfg:
   early_stopping_cfg:
     enabled: false            # disabled in tests for deterministic behavior
     patience: 15
-    monitor: val_mae_max_metric
+    monitor: val_mae_reg_metric
     mode: min
 
   load_weights_cfg:
