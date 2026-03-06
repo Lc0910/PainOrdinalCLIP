@@ -1,0 +1,8 @@
+# 3 base ranks for RankPromptLearner interpolation (5-class BioVid)
+# Base ranks: no pain (0), moderate pain (2), severe pain (4)
+# Interpolated: weak pain (1), strong pain (3)
+runner_cfg:
+  model_cfg:
+    prompt_learner_cfg:
+      num_base_ranks: 3
+      init_rank_path: configs/base_cfgs/data_cfg/datasets/biovid/classnames_3base.txt
