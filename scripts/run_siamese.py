@@ -135,9 +135,9 @@ def load_callbacks(output_dir: Path, early_stopping_cfg: Optional[dict] = None):
     (output_dir / "ckpts").mkdir(exist_ok=True, parents=True)
     callbacks = [
         ModelCheckpoint(
-            monitor="val_mae_max_metric",
+            monitor="val_mae_reg_metric",
             dirpath=str(output_dir / "ckpts"),
-            filename="{epoch:02d}-{val_mae_max_metric:.4f}",
+            filename="{epoch:02d}-{val_mae_reg_metric:.4f}",
             verbose=True,
             save_last=True,
             save_top_k=1,
@@ -149,7 +149,7 @@ def load_callbacks(output_dir: Path, early_stopping_cfg: Optional[dict] = None):
     # EarlyStopping (Fabio §5.3: patience=15)
     if early_stopping_cfg and early_stopping_cfg.get("enabled", False):
         es = EarlyStopping(
-            monitor=early_stopping_cfg.get("monitor", "val_mae_max_metric"),
+            monitor=early_stopping_cfg.get("monitor", "val_mae_reg_metric"),
             patience=early_stopping_cfg.get("patience", 15),
             mode=early_stopping_cfg.get("mode", "min"),
             verbose=True,

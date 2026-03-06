@@ -307,17 +307,11 @@ class SiameseRunner(pl.LightningModule):
                 stats[k] = torch.cat(_stats).mean().item()
             except RuntimeError:
                 stats[k] = torch.stack(_stats).mean().item()
+            is_primary = (k == "mae_reg_metric")
             self.log(
                 f"{run_type}_{k}", stats[k],
-                on_step=False, on_epoch=True, prog_bar=False, logger=True,
-            )
-
-        # Monitor key: use regression MAE (primary metric)
-        if f"mae_reg_metric" in stats:
-            self.log(
-                f"{run_type}_mae_max_metric",   # keep name for ckpt monitor compat
-                stats["mae_reg_metric"],
-                on_step=False, on_epoch=True, prog_bar=True,
+                on_step=False, on_epoch=True,
+                prog_bar=is_primary, logger=True,
             )
 
         stats["epoch"] = self.current_epoch

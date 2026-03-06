@@ -94,7 +94,7 @@ runner_cfg:
   early_stopping_cfg:
     enabled: true
     patience: 15                  # Fabio default; stop if val MAE stalls 15 epochs
-    monitor: val_mae_max_metric
+    monitor: val_mae_reg_metric
     mode: min
 
   # --- Stage 1 Checkpoint ---
