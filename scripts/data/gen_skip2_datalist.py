@@ -87,7 +87,7 @@ def main():
         outputs = [Path(p) for p in args.output]
         assert len(outputs) == len(inputs), "Number of --output must match --input"
     else:
-        outputs = [p.with_stem(p.stem + args.suffix) for p in inputs]
+        outputs = [p.parent / (p.stem + args.suffix + p.suffix) for p in inputs]
 
     print(f"Skipping first {args.skip} frames per video:\n")
     for inp, out in zip(inputs, outputs):
