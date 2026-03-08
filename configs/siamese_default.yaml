@@ -103,6 +103,16 @@ runner_cfg:
 
   ckpt_path: ""
 
+  # --- AU Feature Fusion ---
+  # Early concatenation of AU (Action Unit) features before SharedMLP.
+  # AU features are extracted from OpenFace and stored in .npz files.
+  # When enabled, SharedMLP input dim changes from D to D + au_dim.
+  au_cfg:
+    enabled: false               # set true to use AU fusion
+    au_npz_path: ""              # path to .npz file with AU features
+    au_dim: 17                   # 17 (all AUs) or 8 (pain-relevant subset)
+    au_dropout: 0.1              # dropout on AU features before concatenation
+
   # --- Anchor-Based Ranking Inference ---
   anchor_inference_cfg:
     enabled: false               # set true to use ranking head at inference

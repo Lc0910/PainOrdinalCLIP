@@ -26,6 +26,7 @@ import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 from PIL import Image
@@ -36,6 +37,61 @@ from ordinalclip.utils.logging import get_logger
 from .utils import get_transforms
 
 logger = get_logger(__name__)
+
+
+# ================================================================
+#  AU Feature Store
+# ================================================================
+
+class AUFeatureStore:
+    """Lazy-loaded .npz AU feature lookup with O(1) per-frame access.
+
+    Keys in the .npz are frame paths (e.g., "images/071313_m_41-BL1-081_50.jpg")
+    matching the paths in the data list files. Values are AU intensity vectors.
+
+    Lazy loading: the .npz is only read on first __getitem__ call,
+    avoiding memory overhead during DataModule initialization.
+    """
+
+    def __init__(self, npz_path: str, au_dim: int = 17) -> None:
+        self._npz_path = npz_path
+        self._au_dim = au_dim
+        self._data: Optional[Dict[str, np.ndarray]] = None
+
+    def _load(self) -> None:
+        """Load .npz data. Called lazily on first access or eagerly before DataLoader fork.
+
+        Note: this loader is safe under DataLoader's process-based multiprocessing
+        (each worker gets a copy via fork). Pre-loading avoids 8x memory waste.
+        """
+        raw = np.load(self._npz_path, allow_pickle=False)
+        self._data = {k: raw[k] for k in raw.files}
+        logger.info(
+            f"AUFeatureStore loaded: {len(self._data)} entries from {self._npz_path}"
+        )
+
+    def __getitem__(self, frame_path: str) -> torch.Tensor:
+        if self._data is None:
+            self._load()
+        assert self._data is not None
+        arr = self._data.get(frame_path)
+        if arr is not None:
+            return torch.tensor(arr, dtype=torch.float32)  # [au_dim]
+        else:
+            # Missing frame — return zeros (logged at extraction time)
+            return torch.zeros(self._au_dim, dtype=torch.float32)
+
+    def __contains__(self, frame_path: str) -> bool:
+        if self._data is None:
+            self._load()
+        assert self._data is not None
+        return frame_path in self._data
+
+    def __len__(self) -> int:
+        if self._data is None:
+            self._load()
+        assert self._data is not None
+        return len(self._data)
 
 
 def _parse_video_id(img_path: str) -> str:
@@ -80,10 +136,12 @@ class PairwiseDataset(Dataset):
         data_file: str,
         transforms,
         pairs_per_epoch: int = 10000,
+        au_store: Optional[AUFeatureStore] = None,
     ):
         self.images_root = images_root
         self.transforms = transforms
         self.pairs_per_epoch = pairs_per_epoch
+        self.au_store = au_store
 
         # Parse data file and group by (label, subject_id)
         self.images_by_label: Dict[int, List[str]] = defaultdict(list)
@@ -171,6 +229,12 @@ class PairwiseDataset(Dataset):
         # 5. Pair label: 1 if A > B, 0 if A < B
         pair_label = 1 if label_a > label_b else 0
 
+        # 6. AU features (optional)
+        if self.au_store is not None:
+            au_a = self.au_store[img_path_a]  # [au_dim]
+            au_b = self.au_store[img_path_b]  # [au_dim]
+            return img_a, img_b, pair_label, label_a, label_b, au_a, au_b
+
         return img_a, img_b, pair_label, label_a, label_b
 
     def _load_image(self, img_path: str) -> torch.Tensor:
@@ -183,11 +247,33 @@ class PairwiseDataset(Dataset):
         return img
 
 
+class AURegressionDatasetWrapper(Dataset):
+    """Wraps a RegressionDataset to append AU features to each sample.
+
+    Original RegressionDataset returns: (img, target, img_file)
+    This wrapper returns:               (img, target, img_file, au_feat)
+    """
+
+    def __init__(self, base_dataset, au_store: AUFeatureStore) -> None:
+        self.base_dataset = base_dataset
+        self.au_store = au_store
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, index: int):
+        result = self.base_dataset[index]
+        img, target, img_file = result[0], result[1], result[2]
+        au_feat = self.au_store[img_file]  # [au_dim]
+        return img, target, img_file, au_feat
+
+
 class SiameseDataModule(pl.LightningDataModule):
     """Data module for Siamese Stage 2.
 
     - Train: PairwiseDataset (online pair sampling, cross-subject)
     - Val/Test: original RegressionDataset (frame-level + video aggregation)
+    - AU features: optional, appended to each sample when au_cfg.enabled=True
     """
 
     def __init__(
@@ -202,6 +288,7 @@ class SiameseDataModule(pl.LightningDataModule):
         train_dataloder_cfg: dict,
         eval_dataloder_cfg: dict,
         pairs_per_epoch: int = 10000,
+        au_cfg: Optional[dict] = None,
         # Ignored fields from parent data_cfg (for compatibility)
         **kwargs,
     ):
@@ -217,17 +304,63 @@ class SiameseDataModule(pl.LightningDataModule):
                 )
         train_transforms, eval_transforms = get_transforms(**transforms_cfg)
 
+        # --- AU Feature Store (optional) ---
+        # When au_cfg.enabled=True, the model's SharedMLP is constructed with
+        # input dim = D + au_dim.  If AU features are not actually available at
+        # runtime the raw CLIP features (dim D) would be fed into a (D+au_dim)
+        # linear layer, causing a dimension mismatch crash.  Therefore we MUST
+        # fail-fast here rather than silently falling back to no-AU mode.
+        au_store: Optional[AUFeatureStore] = None
+        if au_cfg and au_cfg.get("enabled", False):
+            npz_path = au_cfg.get("au_npz_path", "")
+            au_dim = au_cfg.get("au_dim", 17)
+            if not npz_path:
+                raise ValueError(
+                    "au_cfg.enabled=True but au_npz_path is empty.  "
+                    "Either provide a valid .npz path or set au_cfg.enabled=False.  "
+                    "The model's SharedMLP is sized for D+au_dim input; running "
+                    "without AU features would cause a dimension mismatch."
+                )
+            import os
+            if not os.path.isfile(npz_path):
+                raise FileNotFoundError(
+                    f"au_cfg.enabled=True but AU file not found: {npz_path}.  "
+                    f"Run scripts/data/extract_au_features.py first."
+                )
+            if au_dim <= 0:
+                raise ValueError(
+                    f"au_cfg.enabled=True but au_dim={au_dim} (must be > 0).  "
+                    f"Set au_dim to the number of AU columns (17 for all, 8 for pain)."
+                )
+            au_store = AUFeatureStore(npz_path=npz_path, au_dim=au_dim)
+            # Pre-load before DataLoader workers fork.
+            # Without this, each of N workers would independently load the
+            # full .npz, wasting N× memory.  After fork the parent's dict
+            # is shared copy-on-write (Linux) or duplicated cheaply.
+            au_store._load()
+            logger.info(f"AU features enabled: npz={npz_path}, dim={au_dim}")
+        self.au_store = au_store
+
         self.train_set = PairwiseDataset(
             train_images_root,
             train_data_file,
             train_transforms,
             pairs_per_epoch=pairs_per_epoch,
+            au_store=au_store,
         )
 
         from .data import RegressionDataset
 
-        self.val_set = RegressionDataset(val_images_root, val_data_file, eval_transforms)
-        self.test_set = RegressionDataset(test_images_root, test_data_file, eval_transforms)
+        val_dataset = RegressionDataset(val_images_root, val_data_file, eval_transforms)
+        test_dataset = RegressionDataset(test_images_root, test_data_file, eval_transforms)
+
+        # Wrap with AU features for eval datasets
+        if au_store is not None:
+            self.val_set = AURegressionDatasetWrapper(val_dataset, au_store)
+            self.test_set = AURegressionDatasetWrapper(test_dataset, au_store)
+        else:
+            self.val_set = val_dataset
+            self.test_set = test_dataset
 
         self.train_dataloder_cfg = train_dataloder_cfg
         self.eval_dataloder_cfg = eval_dataloder_cfg
@@ -252,6 +385,9 @@ class SiameseDataModule(pl.LightningDataModule):
         Used for computing per-class feature centroids (anchors) for
         anchor-based ranking inference. Uses eval transforms (no augmentation)
         so extracted features are deterministic.
+
+        When AU is enabled, the anchor dataset also returns AU features
+        so anchor centroids are computed in the fused feature space.
         """
         from .data import RegressionDataset
 
@@ -260,4 +396,6 @@ class SiameseDataModule(pl.LightningDataModule):
             self._train_data_file,
             self._eval_transforms,
         )
+        if self.au_store is not None:
+            anchor_set = AURegressionDatasetWrapper(anchor_set, self.au_store)
         return DataLoader(dataset=anchor_set, **self.eval_dataloder_cfg)

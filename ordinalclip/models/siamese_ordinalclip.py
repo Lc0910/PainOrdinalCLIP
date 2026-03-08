@@ -3,8 +3,11 @@
 Architecture (Stage 2, backbone frozen):
   image → OrdinalCLIP backbone → f [B, D]
                                     ↓
+                          (optional) concat AU features
+                            [f ∥ au] [B, D + au_dim]
+                                    ↓
                              SharedMLP (2-layer)
-                             D → hidden → out  (e [B, out])
+                             D(+au) → hidden → out  (e [B, out])
                             /                    \\
               RegressionHead               ConcatRankingHead
               out → 1 → sigmoid            [ei ∥ ej] (2*out) → 1
@@ -23,8 +26,12 @@ Key design decisions vs prior implementation:
     than with the difference (fi − fj). (Fabio §5.3.1, §5.1.1).
   - Regression + hinge instead of classification + BCE: continuous
     regression with adaptive margin is more natural for ordinal data.
+  - AU fusion: optional early concatenation of AU features before SharedMLP.
+    Controlled by au_cfg.enabled; when disabled, zero overhead.
 """
 from __future__ import annotations
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -177,14 +184,39 @@ class SiameseOrdinalCLIP(nn.Module):
         shared_mlp_cfg: dict,
         ranking_head_cfg: dict,
         freeze_backbone: bool = True,
+        au_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.embed_dims = backbone.embed_dims
         self.num_ranks = backbone.num_ranks
 
-        # Shared MLP
-        self.shared_mlp = SharedMLP(embed_dims=self.embed_dims, **shared_mlp_cfg)
+        # AU fusion config
+        self.au_cfg = au_cfg or {"enabled": False}
+        self._au_enabled = self.au_cfg.get("enabled", False)
+        au_dim = self.au_cfg.get("au_dim", 0) if self._au_enabled else 0
+
+        # Fail-fast: enabled + au_dim<=0 is an invalid configuration.
+        # SharedMLP would be built with embed_dims+0 but _fuse_au would still
+        # be called, producing a shape mismatch.
+        if self._au_enabled and au_dim <= 0:
+            raise ValueError(
+                f"au_cfg.enabled=True but au_dim={au_dim} (must be > 0).  "
+                f"Set au_dim to the number of AU columns (17 for all, 8 for pain)."
+            )
+
+        # AU preprocessing layers (LayerNorm + Dropout to align scale with CLIP features)
+        # Always initialize to None for safe hasattr checks
+        self.au_norm: Optional[nn.LayerNorm] = None
+        self.au_dropout: Optional[nn.Dropout] = None
+        if au_dim > 0:
+            self.au_norm = nn.LayerNorm(au_dim)
+            self.au_dropout = nn.Dropout(self.au_cfg.get("au_dropout", 0.1))
+            logger.info(f"AU fusion enabled: au_dim={au_dim}, dropout={self.au_cfg.get('au_dropout', 0.1)}")
+
+        # Shared MLP — input dim = CLIP embed_dims + au_dim
+        mlp_in_dim = self.embed_dims + au_dim
+        self.shared_mlp = SharedMLP(embed_dims=mlp_in_dim, **shared_mlp_cfg)
         mlp_out = self.shared_mlp.out_dims
 
         # Regression head
@@ -202,23 +234,47 @@ class SiameseOrdinalCLIP(nn.Module):
         n_mlp = sum(p.numel() for p in self.shared_mlp.parameters())
         n_reg = sum(p.numel() for p in self.regression_head.parameters())
         n_rank = sum(p.numel() for p in self.ranking_head.parameters())
+        n_au = sum(p.numel() for p in self.au_norm.parameters()) if au_dim > 0 else 0
         n_total = sum(p.numel() for p in self.parameters())
         logger.info(
-            f"SiameseOrdinalCLIP: shared_mlp={n_mlp:,}, "
+            f"SiameseOrdinalCLIP: shared_mlp={n_mlp:,} (in={mlp_in_dim}), "
             f"regression_head={n_reg:,}, ranking_head={n_rank:,}, "
-            f"total={n_total:,} params"
+            f"au_layers={n_au:,}, total={n_total:,} params"
         )
+
+    def _fuse_au(self, clip_feat: torch.Tensor, au_feat: torch.Tensor) -> torch.Tensor:
+        """Fuse CLIP features with AU features via early concatenation.
+
+        Args:
+            clip_feat: [B, D] CLIP image features
+            au_feat:   [B, au_dim] AU intensity features
+
+        Returns:
+            fused: [B, D + au_dim]
+        """
+        if self.au_norm is None or self.au_dropout is None:
+            raise RuntimeError(
+                "AU layers not initialized. Ensure au_cfg.au_dim > 0 "
+                "when au_cfg.enabled=True."
+            )
+        au_feat = self.au_norm(au_feat.float())    # [B, au_dim]  normalize scale
+        au_feat = self.au_dropout(au_feat)         # [B, au_dim]  regularization
+        return torch.cat([clip_feat, au_feat], dim=-1)  # [B, D + au_dim]
 
     def forward(
         self,
         images_a: torch.Tensor,
         images_b: torch.Tensor,
-    ):
+        au_a: Optional[torch.Tensor] = None,
+        au_b: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pairwise forward for training.
 
         Args:
             images_a: [B, 3, H, W]
             images_b: [B, 3, H, W]
+            au_a:     [B, au_dim] or None  — AU features for image A
+            au_b:     [B, au_dim] or None  — AU features for image B
 
         Returns:
             ranking_logit: [B, 1]  signed score (positive → a > b)
@@ -227,6 +283,11 @@ class SiameseOrdinalCLIP(nn.Module):
         """
         _, feat_a, _ = self.backbone(images_a)  # [B, D]
         _, feat_b, _ = self.backbone(images_b)  # [B, D]
+
+        # AU fusion: early concatenation before SharedMLP
+        if self._au_enabled and au_a is not None and au_b is not None:
+            feat_a = self._fuse_au(feat_a, au_a)  # [B, D + au_dim]
+            feat_b = self._fuse_au(feat_b, au_b)  # [B, D + au_dim]
 
         e_a = self.shared_mlp(feat_a)  # [B, out]
         e_b = self.shared_mlp(feat_b)  # [B, out]
@@ -239,8 +300,16 @@ class SiameseOrdinalCLIP(nn.Module):
 
         return ranking_logit, reg_score_a, reg_score_b
 
-    def forward_single(self, images: torch.Tensor):
+    def forward_single(
+        self,
+        images: torch.Tensor,
+        au_feat: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Single-image forward for val/test.
+
+        Args:
+            images:  [B, 3, H, W]
+            au_feat: [B, au_dim] or None — AU features
 
         Returns:
             logits:         [B, K]  OrdinalCLIP classification logits (for ablation)
@@ -249,7 +318,11 @@ class SiameseOrdinalCLIP(nn.Module):
         """
         logits, feat, _ = self.backbone(images)  # [B, K], [B, D], _
         if feat is not None:
-            e = self.shared_mlp(feat)    # [B, out]
+            # AU fusion before SharedMLP
+            fused = feat
+            if self._au_enabled and au_feat is not None:
+                fused = self._fuse_au(feat, au_feat)  # [B, D + au_dim]
+            e = self.shared_mlp(fused)    # [B, out]
             reg_score = self.regression_head(e)  # [B]
         else:
             reg_score = None

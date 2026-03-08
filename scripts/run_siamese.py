@@ -48,7 +48,13 @@ def main(cfg: DictConfig) -> None:
     )
 
     runner = None
-    datamodule = SiameseDataModule(**OmegaConf.to_container(cfg.data_cfg))
+    data_cfg_dict = OmegaConf.to_container(cfg.data_cfg)
+    # Pass au_cfg from runner_cfg to SiameseDataModule so it can create AUFeatureStore
+    au_cfg = OmegaConf.to_container(
+        cfg.runner_cfg.get("au_cfg", OmegaConf.create({"enabled": False}))
+    )
+    data_cfg_dict["au_cfg"] = au_cfg
+    datamodule = SiameseDataModule(**data_cfg_dict)
 
     # Training
     if not cfg.test_only:
