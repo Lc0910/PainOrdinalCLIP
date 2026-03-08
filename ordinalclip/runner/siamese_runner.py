@@ -58,6 +58,7 @@ class SiameseRunner(pl.LightningModule):
         freeze_backbone: bool = True,
         ckpt_path: str = "",
         anchor_inference_cfg: Optional[Dict] = None,
+        au_cfg: Optional[Dict] = None,
     ) -> None:
         super().__init__()
 
@@ -68,15 +69,20 @@ class SiameseRunner(pl.LightningModule):
                 "margin_scale": 1.0,    # adaptive margin = |yi-yj| * margin_scale
             }
 
+        # --- AU config ---
+        self._au_cfg = au_cfg or {"enabled": False}
+        self._au_enabled = self._au_cfg.get("enabled", False)
+
         # --- 1. Build backbone from config (OrdinalCLIP / Baseline) ---
         backbone = MODELS.build(backbone_cfg)
 
-        # --- 2. Build Siamese model ---
+        # --- 2. Build Siamese model (with optional AU fusion) ---
         self.module = SiameseOrdinalCLIP(
             backbone=backbone,
             shared_mlp_cfg=shared_mlp_cfg,
             ranking_head_cfg=ranking_head_cfg,
             freeze_backbone=freeze_backbone,
+            au_cfg=self._au_cfg,
         )
 
         # --- Output & logger (must be initialized before _load_backbone_weights) ---
@@ -115,25 +121,32 @@ class SiameseRunner(pl.LightningModule):
     #  Forward
     # ================================================================
 
-    def forward(self, images_a: torch.Tensor, images_b: torch.Tensor):
+    def forward(self, images_a: torch.Tensor, images_b: torch.Tensor,
+                au_a=None, au_b=None):
         """Pairwise forward for training."""
-        return self.module(images_a, images_b)
+        return self.module(images_a, images_b, au_a, au_b)
 
-    def forward_single(self, images: torch.Tensor):
+    def forward_single(self, images: torch.Tensor, au_feat=None):
         """Single-image forward for val/test."""
-        return self.module.forward_single(images)
+        return self.module.forward_single(images, au_feat)
 
     # ================================================================
     #  Training
     # ================================================================
 
     def training_step(self, batch, batch_idx):
-        img_a, img_b, pair_label, rank_a, rank_b = batch
+        # Unpack batch — with or without AU features
+        if self._au_enabled and len(batch) == 7:
+            img_a, img_b, pair_label, rank_a, rank_b, au_a, au_b = batch
+        else:
+            img_a, img_b, pair_label, rank_a, rank_b = batch[:5]
+            au_a = au_b = None
         # img_a/img_b: [B, 3, H, W]
         # pair_label: [B]  (1 if rank_a > rank_b, 0 otherwise)
         # rank_a/rank_b: [B]  (integer class labels)
+        # au_a/au_b: [B, au_dim] or None
 
-        ranking_logit, reg_score_a, reg_score_b = self.module(img_a, img_b)
+        ranking_logit, reg_score_a, reg_score_b = self.module(img_a, img_b, au_a, au_b)
         # ranking_logit: [B, 1]  signed score (positive → a > b)
         # reg_score_a/b: [B]     continuous ŷ ∈ (0, K-1)
 
@@ -241,7 +254,13 @@ class SiameseRunner(pl.LightningModule):
         """Regression + optional anchor-based ranking evaluation."""
         x, y = batch[0], batch[1]  # [B, 3, H, W], [B]
 
-        logits, image_features, reg_score = self.module.forward_single(x)
+        # AU features: RegressionDataset returns (img, target, path) or
+        # AURegressionDatasetWrapper returns (img, target, path, au_feat)
+        au_feat = None
+        if self._au_enabled and len(batch) >= 4:
+            au_feat = batch[3]  # [B, au_dim]
+
+        logits, image_features, reg_score = self.module.forward_single(x, au_feat)
         # logits:         [B, K]  — OrdinalCLIP classification (ablation)
         # image_features: [B, D]  — raw CLIP features (anchor inference)
         # reg_score:      [B]     — regression head output (primary metric)
@@ -266,7 +285,7 @@ class SiameseRunner(pl.LightningModule):
 
         # Anchor-based ranking inference
         if self._anchors is not None and image_features is not None:
-            rank_metrics = self._compute_rank_predictions(image_features, y)
+            rank_metrics = self._compute_rank_predictions(image_features, y, au_feat=au_feat)
             p_rank = rank_metrics.pop("_p_rank")
             outputs.update(rank_metrics)
 
@@ -551,7 +570,10 @@ class SiameseRunner(pl.LightningModule):
     # ================================================================
 
     def _compute_rank_predictions(
-        self, image_features: torch.Tensor, y: torch.Tensor
+        self,
+        image_features: torch.Tensor,
+        y: torch.Tensor,
+        au_feat: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Anchor-based rank predictions using concat ranking head.
 
@@ -570,6 +592,7 @@ class SiameseRunner(pl.LightningModule):
         Args:
             image_features: [B, D] raw CLIP features
             y:              [B]
+            au_feat:        [B, au_dim] or None — AU features for fusion
 
         Returns:
             Dict with mae_rank_metric, acc_rank_metric, predict_y_rank, _p_rank.
@@ -577,8 +600,13 @@ class SiameseRunner(pl.LightningModule):
         dtype = image_features.dtype
         K = self.num_ranks
 
-        # Project test features through SharedMLP
-        e_x = self.module.shared_mlp(image_features.type(dtype))  # [B, out]
+        # Fuse AU features before SharedMLP when enabled
+        feat = image_features.type(dtype)  # [B, D]
+        if self._au_enabled and au_feat is not None:
+            feat = self.module._fuse_au(feat, au_feat.float())  # [B, D + au_dim]
+
+        # Project through SharedMLP
+        e_x = self.module.shared_mlp(feat)  # [B, out]
 
         if K == 2:
             return self._compute_rank_predictions_binary(e_x, y)
@@ -692,12 +720,15 @@ class SiameseRunner(pl.LightningModule):
         """
         param_dict_ls = []
 
-        # Siamese heads (always trained)
+        # Siamese heads (always trained) + AU layers if present
         siamese_params = (
             list(self.module.shared_mlp.parameters())
             + list(self.module.regression_head.parameters())
             + list(self.module.ranking_head.parameters())
         )
+        # Include AU preprocessing layers (LayerNorm) in siamese param group
+        if self._au_enabled and self.module.au_norm is not None:
+            siamese_params += list(self.module.au_norm.parameters())
         if lr_siamese_heads > 0:
             param_dict_ls.append({
                 "params": siamese_params,
@@ -804,15 +835,25 @@ class SiameseRunner(pl.LightningModule):
             for batch in anchor_loader:
                 images = batch[0].to(self.device)
                 labels = batch[1]
-                _, image_features, _ = self.module.forward_single(images)
+                # AU features: anchor_dataloader wraps with AURegressionDatasetWrapper
+                # when AU is enabled → batch has 4 elements
+                au_feat = batch[3].to(self.device) if self._au_enabled and len(batch) >= 4 else None
+
+                # Get raw CLIP features directly from backbone (skip full forward_single)
+                _, image_features, _ = self.module.backbone(images)
                 # image_features: [B, D] raw CLIP features
                 if image_features is None:
                     raise RuntimeError(
                         "Backbone does not produce image_features (e.g. Baseline). "
                         "Anchor inference requires OrdinalCLIP backbone."
                     )
-                # Project through SharedMLP to get anchor embedding
-                e = self.module.shared_mlp(image_features.float())  # [B, out]
+
+                # Fuse AU if enabled, then project through SharedMLP
+                feat = image_features.float()  # [B, D]
+                if self._au_enabled and au_feat is not None:
+                    feat = self.module._fuse_au(feat, au_feat.float())  # [B, D + au_dim]
+                e = self.module.shared_mlp(feat)  # [B, out]
+
                 e = e.cpu()
                 for i in range(labels.size(0)):
                     feat_accum[labels[i].item()].append(e[i])

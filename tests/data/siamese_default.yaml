@@ -71,6 +71,12 @@ runner_cfg:
     monitor: val_mae_reg_metric
     mode: min
 
+  au_cfg:
+    enabled: false
+    au_npz_path: ""
+    au_dim: 17
+    au_dropout: 0.1
+
   load_weights_cfg:
     backbone_ckpt_path: null
 
