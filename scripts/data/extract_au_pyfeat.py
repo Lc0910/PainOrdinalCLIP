@@ -51,8 +51,12 @@ import numpy as np
 ALL_AU_NAMES: List[str] = [
     "AU01", "AU02", "AU04", "AU05", "AU06", "AU07",
     "AU09", "AU10", "AU12", "AU14", "AU15", "AU17",
-    "AU20", "AU23", "AU25", "AU26", "AU45",
+    "AU20", "AU23", "AU25", "AU26", "AU43",
 ]
+# NOTE: Changed AU45 → AU43.  py-feat only outputs up to AU43 (eye closure).
+# AU45 (blink) is an OpenFace-specific column; using it here produced a
+# constant-zero dimension in the .npz, silently reducing 17-AU to 16-AU.
+# If the .npz was generated with the old AU45 list, it must be re-extracted.
 
 PAIN_AU_NAMES: List[str] = [
     "AU04",  # brow lowerer
@@ -149,18 +153,31 @@ def extract_au_for_images(
                             au_vec[i] = float(val) if not np.isnan(float(val)) else 0.0
                     result[img_path] = au_vec
         else:
-            # Fallback: assume one row per image, in order
-            for idx, img_path in enumerate(batch_paths):
-                if idx < len(detections):
+            # Fallback: no 'input' column — row-order alignment is unreliable.
+            # When row count mismatches (py-feat returned 0 or >1 faces for
+            # some images), rows and images are misaligned and ALL subsequent
+            # AU vectors would be wrong.  Fill with zeros instead of writing
+            # silently corrupted data.
+            if len(detections) != len(batch_paths):
+                print(
+                    f"  ERROR: py-feat returned {len(detections)} rows "
+                    f"for {len(batch_paths)} images (batch {batch_start}-{batch_end}). "
+                    f"Row-order fallback REFUSED — filling entire batch with "
+                    f"zeros. Upgrade py-feat to >=0.6 for reliable 'input' "
+                    f"column matching."
+                )
+                for img_path in batch_paths:
+                    result[img_path] = np.zeros(au_dim, dtype=np.float32)
+                n_failed += len(batch_paths)
+            else:
+                # Row count matches — 1:1 alignment is safe
+                for idx, img_path in enumerate(batch_paths):
                     au_vec = np.zeros(au_dim, dtype=np.float32)
                     for i, col in enumerate(au_names):
                         if col in detections.columns:
                             val = detections.iloc[idx][col]
                             au_vec[i] = float(val) if not np.isnan(float(val)) else 0.0
                     result[img_path] = au_vec
-                else:
-                    result[img_path] = np.zeros(au_dim, dtype=np.float32)
-                    n_failed += 1
 
         if (batch_start // batch_size) % 10 == 0 or batch_end == n_total:
             print(

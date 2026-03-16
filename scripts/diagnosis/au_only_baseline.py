@@ -78,6 +78,8 @@ def load_au_dataset(
     labels_list: List[int] = []
     paths_list: List[str] = []
     n_missing = 0
+    n_total_lines = 0
+    first_missing_key: Optional[str] = None
 
     with open(data_list_path, "r") as f:
         for line in f:
@@ -87,10 +89,13 @@ def load_au_dataset(
             parts = line.split()
             img_path = parts[0]
             label = int(parts[1])
+            n_total_lines += 1
 
             au_vec = npz_data.get(img_path)
             if au_vec is None:
                 n_missing += 1
+                if first_missing_key is None:
+                    first_missing_key = img_path
                 continue
 
             assert au_vec.shape == (au_dim,), (
@@ -104,10 +109,25 @@ def load_au_dataset(
     features = np.stack(features_list, axis=0).astype(np.float32)  # [N, au_dim]
     labels = np.array(labels_list, dtype=np.int64)  # [N]
 
+    coverage = len(features) / n_total_lines * 100 if n_total_lines > 0 else 0
     logger.info(
-        f"Loaded {len(features)} frames from {data_list_path} "
-        f"(skipped {n_missing} missing in NPZ)"
+        f"Loaded {len(features)}/{n_total_lines} frames from {data_list_path} "
+        f"(coverage={coverage:.1f}%, missing={n_missing})"
     )
+    if n_missing > 0:
+        logger.warning(
+            f"  {n_missing} frames in data list have no matching NPZ key! "
+            f"First missing: '{first_missing_key}'"
+        )
+        # Show a sample NPZ key for debugging key format mismatch
+        sample_npz_key = next(iter(npz_data.keys()))
+        logger.warning(f"  Sample NPZ key:     '{sample_npz_key}'")
+        logger.warning(f"  First missing path:  '{first_missing_key}'")
+    if coverage < 95.0:
+        logger.error(
+            f"  CRITICAL: NPZ coverage is only {coverage:.1f}%. "
+            f"Results will be unreliable. Check key format mismatch."
+        )
 
     # Per-class counts
     unique, counts = np.unique(labels, return_counts=True)
@@ -184,19 +204,35 @@ def compute_frame_metrics(
 # Feature statistics
 # ---------------------------------------------------------------------------
 
-def log_feature_stats(features: np.ndarray, name: str) -> None:
+def log_feature_stats(features: np.ndarray, name: str, au_dim: int) -> None:
     """Log per-dimension statistics for sanity check."""
     mean = features.mean(axis=0)  # [au_dim]
     std = features.std(axis=0)  # [au_dim]
-    logger.info(f"Feature stats ({name}):")
+    logger.info(f"Feature stats ({name}, {au_dim}-d):")
     for i in range(features.shape[1]):
         logger.info(
             f"  dim {i:2d}: mean={mean[i]:.4f}, std={std[i]:.4f}, "
             f"min={features[:, i].min():.4f}, max={features[:, i].max():.4f}"
         )
+    # Detect constant dimensions (likely AU45/AU43 extraction bug)
+    constant_dims = []
+    for i in range(features.shape[1]):
+        if std[i] < 1e-6:
+            constant_dims.append(i)
+    if constant_dims:
+        logger.warning(
+            f"  CONSTANT dimensions detected: {constant_dims} (std < 1e-6). "
+            f"These contribute no information. If dim {features.shape[1]-1} is "
+            f"constant and au_dim=17, this is likely the AU45 extraction bug — "
+            f"py-feat does not output AU45 (only up to AU43). "
+            f"Re-extract with the fixed extract_au_pyfeat.py."
+        )
     n_low_var = int(np.sum(std < 0.01))
-    if n_low_var > 0:
-        logger.warning(f"  {n_low_var} dimensions have std < 0.01 (near-constant)")
+    if n_low_var > 0 and n_low_var != len(constant_dims):
+        logger.warning(
+            f"  {n_low_var} dimensions have std < 0.01 (near-constant, "
+            f"may carry minimal signal)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +591,7 @@ def main() -> None:
     X_train, y_train, paths_train = load_au_dataset(args.au_npz, args.train_list, args.au_dim)
     X_test, y_test, paths_test = load_au_dataset(args.au_npz, args.test_list, args.au_dim)
 
-    log_feature_stats(X_train, "train")
+    log_feature_stats(X_train, "train", args.au_dim)
 
     all_results: Dict = {
         "config": {
