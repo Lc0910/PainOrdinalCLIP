@@ -57,6 +57,8 @@ class AUFeatureStore:
         self._npz_path = npz_path
         self._au_dim = au_dim
         self._data: Optional[Dict[str, np.ndarray]] = None
+        self._n_missing = 0
+        self._n_total = 0
 
     def _load(self) -> None:
         """Load .npz data. Called lazily on first access or eagerly before DataLoader fork.
@@ -74,12 +76,51 @@ class AUFeatureStore:
         if self._data is None:
             self._load()
         assert self._data is not None
+        self._n_total += 1
         arr = self._data.get(frame_path)
         if arr is not None:
             return torch.tensor(arr, dtype=torch.float32)  # [au_dim]
         else:
-            # Missing frame — return zeros (logged at extraction time)
+            self._n_missing += 1
+            if self._n_missing == 1:
+                logger.warning(
+                    f"AUFeatureStore: first missing key: '{frame_path}'. "
+                    f"Returning zero vector. Check NPZ key format vs data list paths."
+                )
+            if self._n_missing in (1, 10, 100, 1000) or self._n_missing % 5000 == 0:
+                logger.warning(
+                    f"AUFeatureStore: {self._n_missing}/{self._n_total} lookups "
+                    f"missing so far ({self._n_missing/self._n_total*100:.1f}%)"
+                )
             return torch.zeros(self._au_dim, dtype=torch.float32)
+
+    def report(self) -> str:
+        """Return a summary string. Call at epoch end or training finish."""
+        if self._n_total == 0:
+            return "AUFeatureStore: no lookups recorded"
+        ratio = self._n_missing / self._n_total * 100
+        return (
+            f"AUFeatureStore: {self._n_missing}/{self._n_total} missing "
+            f"({ratio:.1f}%), au_dim={self._au_dim}"
+        )
+
+    def check_missing_ratio(self, max_ratio: float = 0.5) -> None:
+        """Raise RuntimeError if missing ratio exceeds threshold.
+
+        Call after the first epoch to catch NPZ key mismatches early.
+        Default threshold 50% — if more than half of lookups miss, the NPZ
+        is almost certainly keyed differently from the data list.
+        """
+        if self._n_total == 0:
+            return
+        ratio = self._n_missing / self._n_total
+        if ratio > max_ratio:
+            raise RuntimeError(
+                f"AUFeatureStore: {self._n_missing}/{self._n_total} "
+                f"({ratio*100:.1f}%) lookups missing, exceeds threshold "
+                f"{max_ratio*100:.0f}%. NPZ keys likely don't match data list paths. "
+                f"First missing key was logged above."
+            )
 
     def __contains__(self, frame_path: str) -> bool:
         if self._data is None:

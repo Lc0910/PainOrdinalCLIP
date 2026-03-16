@@ -202,6 +202,13 @@ class SiameseRunner(pl.LightningModule):
         self._train_ranking_scores.clear()
         self._train_ranking_labels.clear()
 
+        # AU feature store health check — after first epoch, verify NPZ coverage
+        if self._au_enabled and self.current_epoch == 0:
+            dm = self.trainer.datamodule
+            if dm is not None and hasattr(dm, "au_store") and dm.au_store is not None:
+                logger.info(dm.au_store.report())
+                dm.au_store.check_missing_ratio(max_ratio=0.5)
+
     # ================================================================
     #  Adaptive Hinge Loss
     # ================================================================
