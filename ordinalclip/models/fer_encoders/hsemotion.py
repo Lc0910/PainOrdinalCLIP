@@ -97,12 +97,17 @@ class HSEmotionNet(nn.Module):
             src_state = recognizer.model.state_dict()
             self._load_compatible_weights(src_state, source_name=f"hsemotion:{model_name}")
         except ImportError:
-            logger.warning(
-                "hsemotion package not installed. Install with: pip install hsemotion. "
-                "Falling back to timm ImageNet pretrained weights."
+            raise ImportError(
+                "hsemotion package is required to load FER pretrained weights. "
+                "Install with: pip install hsemotion\n"
+                "If you intentionally want ImageNet-only weights, set "
+                "hsemotion_model_name=None in the config."
             )
         except Exception as e:
-            logger.warning(f"Failed to load HSEmotion weights ({model_name}): {e}")
+            raise RuntimeError(
+                f"Failed to load HSEmotion weights ({model_name}): {e}\n"
+                "Check that the model name is valid and network is available."
+            ) from e
 
     def _load_weights_from_path(self, path: str) -> None:
         """Load weights from a local checkpoint file."""

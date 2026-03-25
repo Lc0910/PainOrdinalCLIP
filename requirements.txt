@@ -12,3 +12,5 @@ torchvision
 ipython
 tqdm==4.64.0
 openpyxl==3.0.10
+timm>=0.6.0
+hsemotion>=0.4
