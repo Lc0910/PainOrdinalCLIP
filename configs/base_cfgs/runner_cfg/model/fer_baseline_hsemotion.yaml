@@ -1,0 +1,6 @@
+runner_cfg:
+  model_cfg:
+    type: FERBaseline
+    image_encoder_name: hsemotion_b0
+    fer_weights_path: null  # Uses hsemotion package auto-download by default
+    embed_dims: 512
