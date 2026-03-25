@@ -85,6 +85,7 @@ def vit_fer_base(
         ViTFER model.
     """
     model = ViTFER(model_name=model_name, num_classes=num_classes, **kwargs)
+    model.fer_weights_loaded = False
 
     if pretrained_path is not None:
         logger.info(f"Loading ViT-FER pretrained weights from {pretrained_path}")
@@ -109,8 +110,17 @@ def vit_fer_base(
         if skipped:
             logger.info(f"Skipped {len(skipped)} keys: {skipped[:5]}...")
 
+        min_required = len(model_dict) // 2
+        if len(compatible) < min_required:
+            raise RuntimeError(
+                f"ViT-FER checkpoint key mismatch: only {len(compatible)}/{len(model_dict)} "
+                f"model keys matched (min required: {min_required}). "
+                f"Sample checkpoint keys: {list(state_dict.keys())[:5]}"
+            )
+
         model_dict.update(compatible)
         model.load_state_dict(model_dict)
+        model.fer_weights_loaded = True
         logger.info(f"Loaded {len(compatible)}/{len(state_dict)} keys from ViT-FER checkpoint")
 
     return model

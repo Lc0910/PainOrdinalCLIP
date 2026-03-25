@@ -117,23 +117,26 @@ class FERBaseline(nn.Module):
         self.prompt_learner = None
         self.logit_scale = None
 
-        # Loud warning if no FER weights -- experiments would be mislabeled
-        self._has_fer_weights = fer_weights_path is not None
+        # Check if encoder actually loaded FER weights (not just ImageNet)
+        # Encoders set fer_weights_loaded=True after successful FER weight loading.
+        # HSEmotion loads via hsemotion_model_name (fer_weights_path can be None).
+        self._has_fer_weights = getattr(self.image_encoder, "fer_weights_loaded", False)
         if not self._has_fer_weights:
             logger.warning(
                 "=" * 60 + "\n"
-                "  WARNING: fer_weights_path is None!\n"
-                "  The encoder is using ImageNet-only pretrained weights,\n"
-                "  NOT FER-pretrained features. Do NOT label this experiment\n"
-                "  as a 'FER baseline'. Set fer_weights_path to a valid\n"
-                "  checkpoint or use HSEmotion auto-download.\n"
+                "  WARNING: No FER-pretrained weights loaded!\n"
+                "  The encoder is using ImageNet-only pretrained weights.\n"
+                "  Do NOT label this experiment as a 'FER baseline'.\n"
+                "  For DAN/ViT: set fer_weights_path to a valid checkpoint.\n"
+                "  For HSEmotion: ensure hsemotion package is installed.\n"
                 + "=" * 60
             )
 
+        weight_source = fer_weights_path or ("FER (auto-loaded)" if self._has_fer_weights else "NONE (ImageNet only)")
         logger.info(
             f"FERBaseline: encoder={image_encoder_name}, "
             f"embed_dims={embed_dims}, num_ranks={num_ranks}, "
-            f"fer_weights={fer_weights_path or 'NONE (ImageNet only)'}"
+            f"fer_weights={weight_source}"
         )
 
     def forward(self, images: torch.Tensor) -> tuple:

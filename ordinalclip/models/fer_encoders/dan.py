@@ -156,6 +156,7 @@ def dan_resnet18(
         DAN model ready for feature extraction.
     """
     model = DAN(num_classes=num_classes, **kwargs)
+    model.fer_weights_loaded = False
 
     if pretrained_path is not None:
         logger.info(f"Loading DAN pretrained weights from {pretrained_path}")
@@ -163,7 +164,6 @@ def dan_resnet18(
         state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
 
         # DAN checkpoint may have different key names or extra keys
-        # Handle common patterns:
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
         if "model" in state_dict:
@@ -174,7 +174,6 @@ def dan_resnet18(
         compatible = {}
         skipped = []
         for k, v in state_dict.items():
-            # Remove 'module.' prefix from DataParallel checkpoints
             clean_k = k.replace("module.", "")
             if clean_k in model_dict and model_dict[clean_k].shape == v.shape:
                 compatible[clean_k] = v
@@ -184,8 +183,19 @@ def dan_resnet18(
         if skipped:
             logger.info(f"Skipped {len(skipped)} keys with shape mismatch: {skipped[:5]}...")
 
+        # Validate: at least 50% of model keys must be loaded
+        min_required = len(model_dict) // 2
+        if len(compatible) < min_required:
+            raise RuntimeError(
+                f"DAN checkpoint key mismatch: only {len(compatible)}/{len(model_dict)} "
+                f"model keys matched (min required: {min_required}). "
+                f"Check checkpoint format. Sample checkpoint keys: "
+                f"{list(state_dict.keys())[:5]}"
+            )
+
         model_dict.update(compatible)
         model.load_state_dict(model_dict)
+        model.fer_weights_loaded = True
         logger.info(f"Loaded {len(compatible)}/{len(state_dict)} keys from DAN checkpoint")
 
     return model

@@ -1,6 +1,10 @@
+# DAN (ResNet-18 + multi-head cross-attention) FER encoder.
+# REQUIRED: Download DAN checkpoint from github.com/yaoing/DAN
+#   and set fer_weights_path below. Without it, the encoder uses
+#   ImageNet-only weights and the experiment is NOT a FER baseline.
 runner_cfg:
   model_cfg:
     type: FERBaseline
     image_encoder_name: dan_resnet18
-    fer_weights_path: null  # Set to .cache/fer/dan_affecnet7.pth for FER pretrained
+    fer_weights_path: .cache/fer/dan_affecnet7.pth
     embed_dims: 512

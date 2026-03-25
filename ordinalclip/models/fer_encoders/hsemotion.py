@@ -76,6 +76,7 @@ class HSEmotionNet(nn.Module):
 
         # Create backbone without classification head
         self.backbone = timm.create_model(timm_name, pretrained=True, num_classes=0)
+        self.fer_weights_loaded = False
 
         # Load HSEmotion FER weights if available
         if pretrained_path is not None:
@@ -136,8 +137,20 @@ class HSEmotionNet(nn.Module):
             else:
                 skipped.append(clean_k)
 
+        # Validate: at least 50% of backbone keys must match
+        min_required = len(model_dict) // 2
+        if len(compatible) < min_required:
+            raise RuntimeError(
+                f"HSEmotion checkpoint key mismatch: only {len(compatible)}/{len(model_dict)} "
+                f"backbone keys matched from {source_name} (min required: {min_required}). "
+                f"This likely means the checkpoint format is incompatible with the "
+                f"timm EfficientNet backbone. Sample src keys: "
+                f"{list(src_state.keys())[:5]}"
+            )
+
         model_dict.update(compatible)
         self.backbone.load_state_dict(model_dict)
+        self.fer_weights_loaded = True
         logger.info(
             f"Loaded {len(compatible)}/{len(src_state)} keys from {source_name} "
             f"(skipped {len(skipped)}: head/mismatched)"

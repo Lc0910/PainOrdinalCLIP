@@ -1,6 +1,10 @@
+# ViT-Base FER encoder (timm-based).
+# REQUIRED: Provide a FER fine-tuned ViT checkpoint path.
+#   Without it, the encoder uses ImageNet-only weights and
+#   the experiment is NOT a FER baseline.
 runner_cfg:
   model_cfg:
     type: FERBaseline
     image_encoder_name: vit_fer_base
-    fer_weights_path: null  # Set to .cache/fer/vit_fer_affecnet.pth for FER pretrained
+    fer_weights_path: .cache/fer/vit_fer_affecnet.pth
     embed_dims: 512
