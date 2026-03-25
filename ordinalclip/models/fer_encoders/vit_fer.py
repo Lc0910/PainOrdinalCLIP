@@ -88,7 +88,8 @@ def vit_fer_base(
 
     if pretrained_path is not None:
         logger.info(f"Loading ViT-FER pretrained weights from {pretrained_path}")
-        state_dict = torch.load(pretrained_path, map_location="cpu")
+        # weights_only=False: FER checkpoints may contain non-tensor metadata
+        state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
 
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]

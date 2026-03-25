@@ -56,10 +56,12 @@ class CORALLoss(nn.Module):
         """
         B = logits.size(0)
 
-        # Handle K-dim logits from softmax-style models
+        # Handle K-dim logits from softmax-style models.
+        # WARNING: This is a compatibility shim, not true CORAL. The conversion
+        # softmax -> cumulative logits is a lossy round-trip and may have
+        # numerical instability near boundary probabilities. For best results,
+        # the model should natively output K-1 threshold logits.
         if logits.size(1) == self.num_ranks:
-            # Convert K-class logits to K-1 cumulative logits
-            # Use cumulative sum approach: logit_k = sum(logits[:k+1])
             logits = self._softmax_to_cumulative(logits)  # [B, K-1]
 
         assert logits.size(1) == self.num_thresholds, (

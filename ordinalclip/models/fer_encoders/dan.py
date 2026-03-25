@@ -41,7 +41,6 @@ class CrossAttentionHead(nn.Module):
     def __init__(self, in_dim: int) -> None:
         super().__init__()
         self.sa = SpatialAttention()
-        self.query_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
         self.key_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
         self.value_conv = nn.Conv2d(in_dim, in_dim, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
@@ -160,7 +159,8 @@ def dan_resnet18(
 
     if pretrained_path is not None:
         logger.info(f"Loading DAN pretrained weights from {pretrained_path}")
-        state_dict = torch.load(pretrained_path, map_location="cpu")
+        # weights_only=False: FER checkpoints may contain non-tensor metadata
+        state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
 
         # DAN checkpoint may have different key names or extra keys
         # Handle common patterns:

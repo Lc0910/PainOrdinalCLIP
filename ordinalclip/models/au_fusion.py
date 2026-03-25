@@ -76,15 +76,8 @@ class AUGuidedAttentionFusion(nn.Module):
             f"num_heads ({num_heads})"
         )
 
-        # Per-AU embedding: each scalar AU intensity -> D_au vector
-        # This is implemented as a learnable linear layer per AU
-        self.au_embed = nn.Sequential(
-            nn.Linear(au_dim, au_dim * self.hidden_dim),  # [B, A] -> [B, A*D_au]
-        )
-        # Reshape handled in forward: [B, A*D_au] -> [B, A, D_au]
-
-        # Actually, simpler and more parameter-efficient approach:
-        # Each AU gets its own embedding weight + bias
+        # Per-AU tokenization: each AU scalar -> D_au vector via shared projection
+        # + learnable positional embedding per AU identity
         self.au_token_proj = nn.Linear(1, self.hidden_dim)  # shared projection per AU scalar
         self.au_pos_embed = nn.Parameter(
             torch.randn(1, au_dim, self.hidden_dim) * 0.02
@@ -174,7 +167,7 @@ class AUGuidedAttentionFusion(nn.Module):
         """Get per-AU attention weights for interpretability.
 
         Returns:
-            attn_weights: [B, num_heads, 1, A] attention weights over AUs.
+            attn_weights: [B, 1, A] attention weights over AUs (averaged over heads).
         """
         B = visual_feat.size(0)
         au_expanded = au_feat.unsqueeze(-1)  # [B, A, 1]
@@ -245,6 +238,11 @@ class FiLMFusion(nn.Module):
             nn.Linear(au_dim, visual_dim),
             nn.Dropout(dropout),
         )
+        # Init near-zero so initial behavior is close to identity (gamma~=1, beta~=0)
+        nn.init.zeros_(self.gamma_net[0].weight)
+        nn.init.zeros_(self.gamma_net[0].bias)
+        nn.init.zeros_(self.beta_net[0].weight)
+        nn.init.zeros_(self.beta_net[0].bias)
 
     def forward(
         self,
