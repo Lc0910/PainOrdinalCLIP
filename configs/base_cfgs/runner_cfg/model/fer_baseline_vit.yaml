@@ -1,0 +1,6 @@
+runner_cfg:
+  model_cfg:
+    type: FERBaseline
+    image_encoder_name: vit_fer_base
+    fer_weights_path: null  # Set to .cache/fer/vit_fer_affecnet.pth for FER pretrained
+    embed_dims: 512

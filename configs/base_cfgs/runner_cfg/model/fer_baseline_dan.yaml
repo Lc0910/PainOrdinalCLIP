@@ -1,0 +1,6 @@
+runner_cfg:
+  model_cfg:
+    type: FERBaseline
+    image_encoder_name: dan_resnet18
+    fer_weights_path: null  # Set to .cache/fer/dan_affecnet7.pth for FER pretrained
+    embed_dims: 512
