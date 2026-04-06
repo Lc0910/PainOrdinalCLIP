@@ -91,9 +91,11 @@ def vit_fer_base(
         logger.info(f"Loading ViT-FER pretrained weights from {pretrained_path}")
         state_dict = torch.load(pretrained_path, map_location="cpu")
 
-        if "state_dict" in state_dict:
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
-        if "model" in state_dict:
+        elif "model" in state_dict:
             state_dict = state_dict["model"]
 
         model_dict = model.state_dict()

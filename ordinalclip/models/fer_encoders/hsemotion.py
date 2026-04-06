@@ -114,9 +114,11 @@ class HSEmotionNet(nn.Module):
         """Load weights from a local checkpoint file."""
         logger.info(f"Loading HSEmotion weights from {path}")
         state_dict = torch.load(path, map_location="cpu")
-        if "state_dict" in state_dict:
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
-        if "model" in state_dict:
+        elif "model" in state_dict:
             state_dict = state_dict["model"]
         self._load_compatible_weights(state_dict, source_name=path)
 

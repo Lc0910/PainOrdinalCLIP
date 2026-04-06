@@ -165,9 +165,11 @@ def dan_resnet18(
         state_dict = torch.load(pretrained_path, map_location="cpu")
 
         # DAN checkpoint may have different key names or extra keys
-        if "state_dict" in state_dict:
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+        elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
-        if "model" in state_dict:
+        elif "model" in state_dict:
             state_dict = state_dict["model"]
 
         # Filter out mismatched keys (fc layer may differ in num_classes)
