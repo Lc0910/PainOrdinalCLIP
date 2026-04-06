@@ -128,3 +128,5 @@ tmp/
 # Cache
 .cache/
 results.zip
+
+docs/session_archives/
