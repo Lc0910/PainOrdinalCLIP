@@ -57,7 +57,7 @@ class ViTFER(nn.Module):
 
         # Projection to target dimension
         self.fc = nn.Linear(self.backbone_dim, num_classes, bias=False)
-        self.bn = nn.BatchNorm1d(num_classes)
+        self.bn = nn.LayerNorm(num_classes)  # LayerNorm: safe with any batch size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, 3, 224, 224] -> features: [B, num_classes]"""
@@ -89,8 +89,7 @@ def vit_fer_base(
 
     if pretrained_path is not None:
         logger.info(f"Loading ViT-FER pretrained weights from {pretrained_path}")
-        # weights_only=False: FER checkpoints may contain non-tensor metadata
-        state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(pretrained_path, map_location="cpu")
 
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]

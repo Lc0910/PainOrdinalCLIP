@@ -34,12 +34,21 @@ def _build_fer_encoder(
     encoder_name: str,
     num_classes: int,
     pretrained_path: str | None = None,
+    encoder_kwargs: dict | None = None,
 ) -> nn.Module:
     """Instantiate a FER encoder by name.
 
     Looks up the encoder factory in fer_encoders module. Supported names:
         - dan_resnet18
         - vit_fer_base
+        - hsemotion_b0, hsemotion_b2
+
+    Args:
+        encoder_name: Factory function name in fer_encoders.
+        num_classes: Output feature dimension.
+        pretrained_path: Path to FER checkpoint (passed as pretrained_path kwarg).
+        encoder_kwargs: Extra kwargs forwarded to the factory function, e.g.
+            {"hsemotion_model_name": "enet_b0_8_best_vgaf"} for HSEmotion.
     """
     factory = getattr(fer_encoders, encoder_name, None)
     if factory is None:
@@ -51,6 +60,8 @@ def _build_fer_encoder(
     kwargs = {"num_classes": num_classes}
     if pretrained_path:
         kwargs["pretrained_path"] = pretrained_path
+    if encoder_kwargs:
+        kwargs.update(encoder_kwargs)
 
     return factory(**kwargs)
 
@@ -85,6 +96,7 @@ class FERBaseline(nn.Module):
         num_ranks: int | None = None,
         embed_dims: int = 512,
         prompt_learner_cfg: dict | None = None,
+        encoder_kwargs: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -103,7 +115,10 @@ class FERBaseline(nn.Module):
 
         # Build FER image encoder
         self.image_encoder = _build_fer_encoder(
-            image_encoder_name, num_classes=embed_dims, pretrained_path=fer_weights_path
+            image_encoder_name,
+            num_classes=embed_dims,
+            pretrained_path=fer_weights_path,
+            encoder_kwargs=encoder_kwargs,
         )
         # Ensure input_resolution is set (required by some data transforms)
         if not hasattr(self.image_encoder, "input_resolution"):

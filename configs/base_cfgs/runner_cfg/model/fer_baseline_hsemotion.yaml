@@ -1,10 +1,15 @@
 # HSEmotion EfficientNet-B0 FER encoder.
 # FER weights are auto-downloaded via `pip install hsemotion`.
 # fer_weights_path is intentionally null here -- HSEmotion loads
-# VGGFace2->AffectNet weights through hsemotion_model_name internally.
+# pretrained weights through hsemotion_model_name internally.
+# Default: enet_b0_8_best_afew (VGGFace2 pretrained, AFEW best variant).
+# Available: enet_b0_8_best_afew (AFEW), enet_b0_8_best_vgaf (VGAF),
+#            enet_b0_8_va_mtl (VA multi-task)
 runner_cfg:
   model_cfg:
     type: FERBaseline
     image_encoder_name: hsemotion_b0
     fer_weights_path: null
     embed_dims: 512
+    encoder_kwargs:
+      hsemotion_model_name: enet_b0_8_best_afew

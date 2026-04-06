@@ -102,6 +102,8 @@ class DAN(nn.Module):
         pretrained_backbone: bool = True,
     ) -> None:
         super().__init__()
+        # NOTE: pretrained=True is deprecated in torchvision>=0.13.
+        # Use weights=ResNet18_Weights.DEFAULT when upgrading torchvision.
         backbone = resnet18(pretrained=pretrained_backbone)
         self.backbone_dim = 512  # ResNet-18 last layer output dim
 
@@ -125,7 +127,7 @@ class DAN(nn.Module):
 
         # Final projection: num_heads * backbone_dim -> num_classes
         self.fc = nn.Linear(self.backbone_dim * num_heads, num_classes, bias=False)
-        self.bn = nn.BatchNorm1d(num_classes)
+        self.bn = nn.LayerNorm(num_classes)  # LayerNorm: safe with any batch size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, 3, 224, 224] -> features: [B, num_classes]"""
@@ -160,8 +162,7 @@ def dan_resnet18(
 
     if pretrained_path is not None:
         logger.info(f"Loading DAN pretrained weights from {pretrained_path}")
-        # weights_only=False: FER checkpoints may contain non-tensor metadata
-        state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(pretrained_path, map_location="cpu")
 
         # DAN checkpoint may have different key names or extra keys
         if "state_dict" in state_dict:

@@ -1,7 +1,7 @@
 """HSEmotion / EmotiEffNet encoder for facial expression recognition.
 
 Uses EfficientNet-B0/B2 pretrained on VGGFace2 (face recognition) then
-fine-tuned on AffectNet (facial expression recognition).
+fine-tuned on FER datasets (AffectNet, AFEW, VGAF — depends on model variant).
 
 Based on: Savchenko, A.V. (2022). "HSEmotion: High-Speed Emotion Recognition
 Library". ICPR Workshop.
@@ -38,7 +38,7 @@ class HSEmotionNet(nn.Module):
     """HSEmotion EfficientNet wrapper for FER feature extraction.
 
     Loads a timm EfficientNet model and optionally replaces weights with
-    HSEmotion's VGGFace2→AffectNet pretrained checkpoint. The classification
+    HSEmotion's VGGFace2→FER pretrained checkpoint. The classification
     head is replaced with a projection to the desired output dimension.
 
     Args:
@@ -86,7 +86,7 @@ class HSEmotionNet(nn.Module):
 
         # Projection to target dimension
         self.fc = nn.Linear(self.backbone_dim, num_classes, bias=False)
-        self.bn = nn.BatchNorm1d(num_classes)
+        self.bn = nn.LayerNorm(num_classes)  # LayerNorm: safe with any batch size
 
     def _load_hsemotion_weights(self, model_name: str) -> None:
         """Load weights from HSEmotion package's cached checkpoints."""
@@ -113,7 +113,7 @@ class HSEmotionNet(nn.Module):
     def _load_weights_from_path(self, path: str) -> None:
         """Load weights from a local checkpoint file."""
         logger.info(f"Loading HSEmotion weights from {path}")
-        state_dict = torch.load(path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(path, map_location="cpu")
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
         if "model" in state_dict:
@@ -172,7 +172,7 @@ def hsemotion_b0(
 ) -> HSEmotionNet:
     """Create HSEmotion EfficientNet-B0 encoder.
 
-    Default: VGGFace2 → AffectNet pretrained (via hsemotion package).
+    Default: VGGFace2 → AFEW pretrained (enet_b0_8_best_afew, via hsemotion package).
     Input: [B, 3, 224, 224]. Output: [B, num_classes].
     Backbone feature dim: 1280.
 
@@ -198,7 +198,7 @@ def hsemotion_b2(
 ) -> HSEmotionNet:
     """Create HSEmotion EfficientNet-B2 encoder.
 
-    Default: VGGFace2 → AffectNet pretrained (via hsemotion package).
+    Default: VGGFace2 → AffectNet pretrained (enet_b2_8, via hsemotion package).
     Input: [B, 3, 260, 260]. Output: [B, num_classes].
     Backbone feature dim: 1408.
 
