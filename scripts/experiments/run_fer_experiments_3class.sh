@@ -33,6 +33,8 @@ DAN_CFG="configs/base_cfgs/runner_cfg/model/fer_baseline_dan.yaml"
 HSE_B0_CFG="configs/base_cfgs/runner_cfg/model/fer_baseline_hsemotion.yaml"
 BASELINE_CFG="configs/base_cfgs/runner_cfg/model/baseline.yaml"
 ORDINALCLIP_CFG="configs/base_cfgs/runner_cfg/model/ordinalclip.yaml"
+# CLIP ViT-B/16 image encoder override (default.yaml uses RN50)
+VITB16_CFG="configs/base_cfgs/runner_cfg/model/image_encoder/clip-vitb16.yaml"
 
 FT_LR="1e-5"
 RESULT_BASE="results"
@@ -225,6 +227,7 @@ run_experiment "biovid-3cls-hsemotion-b0-ft1e5" \
 run_experiment "biovid-3cls-baseline-vitb16-frozen-ctrl" \
     --config "$DEFAULT_CFG" \
     --config "$BASELINE_CFG" \
+    --config "$VITB16_CFG" \
     --config "$DATA_CFG" \
     --config "$FREEZE_CFG" \
     --cfg_options \
@@ -235,6 +238,7 @@ run_experiment "biovid-3cls-baseline-vitb16-frozen-ctrl" \
 run_experiment "biovid-3cls-baseline-vitb16-ft1e5-ctrl" \
     --config "$DEFAULT_CFG" \
     --config "$BASELINE_CFG" \
+    --config "$VITB16_CFG" \
     --config "$DATA_CFG" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-baseline-vitb16-ft1e5-ctrl" \
