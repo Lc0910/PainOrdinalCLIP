@@ -181,7 +181,8 @@ run_experiment "biovid-3cls-dan-frozen" \
     --config "$FREEZE_CFG" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-dan-frozen" \
-        "runner_cfg.class_weights=${CLASS_WEIGHTS}"
+        "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true"
 
 run_experiment "biovid-3cls-dan-ft1e5" \
     --config "$DEFAULT_CFG" \
@@ -190,6 +191,7 @@ run_experiment "biovid-3cls-dan-ft1e5" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-dan-ft1e5" \
         "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true" \
         "runner_cfg.optimizer_and_scheduler_cfg.param_dict_cfg.lr_image_encoder=${FT_LR}"
 
 # =============================
@@ -203,7 +205,8 @@ run_experiment "biovid-3cls-hsemotion-b0-frozen" \
     --config "$FREEZE_CFG" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-hsemotion-b0-frozen" \
-        "runner_cfg.class_weights=${CLASS_WEIGHTS}"
+        "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true"
 
 run_experiment "biovid-3cls-hsemotion-b0-ft1e5" \
     --config "$DEFAULT_CFG" \
@@ -212,6 +215,7 @@ run_experiment "biovid-3cls-hsemotion-b0-ft1e5" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-hsemotion-b0-ft1e5" \
         "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true" \
         "runner_cfg.optimizer_and_scheduler_cfg.param_dict_cfg.lr_image_encoder=${FT_LR}"
 
 # =============================
@@ -225,7 +229,8 @@ run_experiment "biovid-3cls-baseline-vitb16-frozen-ctrl" \
     --config "$FREEZE_CFG" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-baseline-vitb16-frozen-ctrl" \
-        "runner_cfg.class_weights=${CLASS_WEIGHTS}"
+        "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true"
 
 run_experiment "biovid-3cls-baseline-vitb16-ft1e5-ctrl" \
     --config "$DEFAULT_CFG" \
@@ -234,6 +239,7 @@ run_experiment "biovid-3cls-baseline-vitb16-ft1e5-ctrl" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-baseline-vitb16-ft1e5-ctrl" \
         "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true" \
         "runner_cfg.optimizer_and_scheduler_cfg.param_dict_cfg.lr_image_encoder=${FT_LR}"
 
 # =============================
@@ -249,7 +255,8 @@ run_experiment "biovid-3cls-ordinalclip-frozen" \
     --config "$FREEZE_CFG" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-ordinalclip-frozen" \
-        "runner_cfg.class_weights=${CLASS_WEIGHTS}"
+        "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true"
 
 run_experiment "biovid-3cls-ordinalclip-ft1e5" \
     --config "$DEFAULT_CFG" \
@@ -258,6 +265,7 @@ run_experiment "biovid-3cls-ordinalclip-ft1e5" \
     --cfg_options \
         "runner_cfg.output_dir=${RESULT_BASE}/biovid-3cls-ordinalclip-ft1e5" \
         "runner_cfg.class_weights=${CLASS_WEIGHTS}" \
+        "data_cfg.balanced_sampling=true" \
         "runner_cfg.optimizer_and_scheduler_cfg.param_dict_cfg.lr_image_encoder=${FT_LR}"
 
 # =============================
