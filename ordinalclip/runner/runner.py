@@ -3,6 +3,7 @@ import json
 from collections import defaultdict
 from multiprocessing.sharedctypes import Value
 from pathlib import Path, PurePosixPath
+from typing import List, Optional
 
 import pytorch_lightning as pl
 import torch
@@ -34,7 +35,7 @@ class Runner(pl.LightningModule):
         ckpt_path="",
         ordinal_soft_label: bool = False,
         ordinal_soft_label_sigma: float = 1.0,
-        class_weights: list | None = None,
+        class_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.module = MODELS.build(model_cfg)
