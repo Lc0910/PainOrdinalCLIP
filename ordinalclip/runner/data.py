@@ -2,12 +2,12 @@ import math
 import os
 import os.path as osp
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import pytorch_lightning as pl
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from ordinalclip.utils.logging import get_logger, print_log
 
@@ -31,8 +31,9 @@ class RegressionDataModule(pl.LightningDataModule):
         eval_dataloder_cfg=None,
         few_shot=None,
         label_distributed_shift=None,
-        use_long_tail=False
-    ):
+        use_long_tail=False,
+        balanced_sampling: bool = False,
+    ) -> None:
         super().__init__()
         train_transforms, eval_transforms = get_transforms(**transforms_cfg)
 
@@ -48,8 +49,30 @@ class RegressionDataModule(pl.LightningDataModule):
 
         self.train_dataloder_cfg = train_dataloder_cfg
         self.eval_dataloder_cfg = eval_dataloder_cfg
+        self.balanced_sampling = balanced_sampling
+
+    def _build_balanced_sampler(self) -> WeightedRandomSampler:
+        """Inverse-frequency per-sample weights so each class is drawn equally."""
+        train_labels = [lbl[len(lbl) // 2] for lbl in self.train_set.labels]
+        class_counts = Counter(train_labels)
+        n_total = len(train_labels)
+        # Per-sample weight = 1 / count(its class)
+        sample_weights = [1.0 / class_counts[lbl] for lbl in train_labels]
+        logger.info(
+            f"WeightedRandomSampler: class_counts={dict(class_counts)} "
+            f"n_total={n_total}"
+        )
+        return WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=n_total,
+            replacement=True,
+        )
 
     def train_dataloader(self):
+        if self.balanced_sampling:
+            cfg = {k: v for k, v in self.train_dataloder_cfg.items() if k != "shuffle"}
+            sampler = self._build_balanced_sampler()
+            return DataLoader(dataset=self.train_set, sampler=sampler, **cfg)
         return DataLoader(dataset=self.train_set, **self.train_dataloder_cfg)
 
     def val_dataloader(self):
