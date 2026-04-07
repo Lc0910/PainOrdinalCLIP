@@ -34,11 +34,16 @@ class Runner(pl.LightningModule):
         ckpt_path="",
         ordinal_soft_label: bool = False,
         ordinal_soft_label_sigma: float = 1.0,
+        class_weights: list | None = None,
     ) -> None:
         super().__init__()
         self.module = MODELS.build(model_cfg)
 
-        self.ce_loss_func = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            ce_weight = torch.tensor(class_weights, dtype=torch.float32)
+            self.ce_loss_func = nn.CrossEntropyLoss(weight=ce_weight)
+        else:
+            self.ce_loss_func = nn.CrossEntropyLoss()
         self.kl_loss_func = nn.KLDivLoss(reduction="sum")
         self.loss_weights = loss_weights
         self.ordinal_soft_label = ordinal_soft_label
