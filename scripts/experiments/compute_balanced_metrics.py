@@ -60,7 +60,12 @@ except ImportError:
 
 @dataclass(frozen=True)
 class ExperimentMetrics:
-    """Metrics for a single experiment."""
+    """Metrics for a single experiment.
+
+    Contains both raw (test-set-distribution-weighted) and balanced
+    (per-class-equal-weighted) metrics so the reader can see how much
+    the imbalance is hiding.
+    """
 
     name: str
     num_classes: int
@@ -70,10 +75,16 @@ class ExperimentMetrics:
     balanced_accuracy: float
     macro_f1: float
     weighted_f1: float
+    mae: float
+    mae_continuous: float
+    macro_mae: float
+    macro_mae_continuous: float
     per_class_precision: List[float]
     per_class_recall: List[float]
     per_class_f1: List[float]
     per_class_support: List[int]
+    per_class_mae: List[float]
+    per_class_mae_continuous: List[float]
     confusion: List[List[int]]
 
     def to_dict(self) -> dict:
@@ -86,10 +97,16 @@ class ExperimentMetrics:
             "balanced_accuracy": round(self.balanced_accuracy, 4),
             "macro_f1": round(self.macro_f1, 4),
             "weighted_f1": round(self.weighted_f1, 4),
+            "mae": round(self.mae, 4),
+            "mae_continuous": round(self.mae_continuous, 4),
+            "macro_mae": round(self.macro_mae, 4),
+            "macro_mae_continuous": round(self.macro_mae_continuous, 4),
             "per_class_precision": [round(v, 4) for v in self.per_class_precision],
             "per_class_recall": [round(v, 4) for v in self.per_class_recall],
             "per_class_f1": [round(v, 4) for v in self.per_class_f1],
             "per_class_support": self.per_class_support,
+            "per_class_mae": [round(v, 4) for v in self.per_class_mae],
+            "per_class_mae_continuous": [round(v, 4) for v in self.per_class_mae_continuous],
             "confusion": self.confusion,
         }
 
@@ -103,14 +120,19 @@ def find_latest_version(experiment_dir: Path) -> Optional[Path]:
     return versions[-1] if versions else None
 
 
-def load_predictions(csv_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
+def load_predictions(
+    csv_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Load the latest-epoch predictions from a test_video_predictions.csv.
 
     CSV schema: epoch, ckpt_path, video_id, gt, pred_exp, pred_max, n_frames
 
     Returns:
-        y_true: [N] ground-truth labels (int)
-        y_pred: [N] predicted labels (rounded pred_max)
+        y_true: [N] ground-truth labels (int).
+        y_pred: [N] predicted labels (rounded pred_max, int).
+        y_pred_continuous: [N] continuous predictions (pred_exp, float).
+            Used for MAE computation without rounding — better signal for
+            ordinal tasks than the discrete rounded version.
         last_epoch: The epoch number of the predictions used.
     """
     rows: List[dict] = []
@@ -131,13 +153,38 @@ def load_predictions(csv_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
         [int(round(float(r["pred_max"]))) for r in latest],
         dtype=np.int64,
     )
-    return y_true, y_pred, last_epoch
+    y_pred_continuous = np.array(
+        [float(r["pred_exp"]) for r in latest],
+        dtype=np.float64,
+    )
+    return y_true, y_pred, y_pred_continuous, last_epoch
+
+
+def _compute_per_class_mae(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    num_classes: int,
+) -> List[float]:
+    """MAE computed separately per ground-truth class.
+
+    Returns one MAE value per class. If a class has zero samples its MAE
+    is reported as NaN.
+    """
+    per_class: List[float] = []
+    for c in range(num_classes):
+        mask = y_true == c
+        if mask.sum() == 0:
+            per_class.append(float("nan"))
+        else:
+            per_class.append(float(np.mean(np.abs(y_pred[mask] - y_true[mask]))))
+    return per_class
 
 
 def compute_metrics(
     name: str,
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    y_pred_continuous: np.ndarray,
     last_epoch: int,
 ) -> ExperimentMetrics:
     num_classes = int(max(y_true.max(), y_pred.max())) + 1
@@ -145,11 +192,28 @@ def compute_metrics(
     # Clip predictions into the valid label range (rounded pred_max may be
     # out of range, especially when the model has not converged).
     y_pred_clipped = np.clip(y_pred, 0, num_classes - 1)
+    y_pred_cont_clipped = np.clip(y_pred_continuous, 0.0, float(num_classes - 1))
 
     overall_acc = accuracy_score(y_true, y_pred_clipped)
     balanced_acc = balanced_accuracy_score(y_true, y_pred_clipped)
     macro_f1 = f1_score(y_true, y_pred_clipped, average="macro", zero_division=0)
     weighted_f1 = f1_score(y_true, y_pred_clipped, average="weighted", zero_division=0)
+
+    # MAE (discrete, argmax prediction — matches Runner's "mae_max")
+    mae = float(np.mean(np.abs(y_pred_clipped - y_true)))
+    per_class_mae = _compute_per_class_mae(y_true, y_pred_clipped, num_classes)
+    valid_mae = [v for v in per_class_mae if not np.isnan(v)]
+    macro_mae = float(np.mean(valid_mae)) if valid_mae else float("nan")
+
+    # MAE (continuous, expectation — matches Runner's "mae_exp")
+    mae_cont = float(np.mean(np.abs(y_pred_cont_clipped - y_true)))
+    per_class_mae_cont = _compute_per_class_mae(
+        y_true, y_pred_cont_clipped, num_classes
+    )
+    valid_mae_cont = [v for v in per_class_mae_cont if not np.isnan(v)]
+    macro_mae_cont = (
+        float(np.mean(valid_mae_cont)) if valid_mae_cont else float("nan")
+    )
 
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred_clipped, labels=list(range(num_classes)), zero_division=0
@@ -165,10 +229,16 @@ def compute_metrics(
         balanced_accuracy=float(balanced_acc),
         macro_f1=float(macro_f1),
         weighted_f1=float(weighted_f1),
+        mae=mae,
+        mae_continuous=mae_cont,
+        macro_mae=macro_mae,
+        macro_mae_continuous=macro_mae_cont,
         per_class_precision=[float(v) for v in precision],
         per_class_recall=[float(v) for v in recall],
         per_class_f1=[float(v) for v in f1],
         per_class_support=[int(v) for v in support],
+        per_class_mae=per_class_mae,
+        per_class_mae_continuous=per_class_mae_cont,
         confusion=cm.tolist(),
     )
 
@@ -197,50 +267,73 @@ def scan_experiments(
 
 
 def format_table(metrics_list: List[ExperimentMetrics]) -> str:
-    """Format a summary table for terminal output."""
+    """Format a summary table for terminal output.
+
+    Columns:
+        Acc          - overall accuracy (imbalance-dominated)
+        BalAcc       - balanced accuracy (per-class recall mean)
+        MacroF1      - macro-averaged F1
+        MAE          - raw MAE (imbalance-dominated)
+        MacroMAE     - MAE averaged across classes (balanced-test equivalent)
+        Epoch        - checkpoint epoch of the evaluated predictions
+    """
     header_fmt = (
-        "{name:<48s} {acc:>10s} {bal:>12s} {mf1:>10s} {wf1:>10s} {ep:>6s}"
+        "{name:<46s} {acc:>8s} {bal:>8s} {mf1:>8s} "
+        "{mae:>8s} {mmae:>10s} {ep:>6s}"
     )
     row_fmt = (
-        "{name:<48s} {acc:>10.4f} {bal:>12.4f} {mf1:>10.4f} {wf1:>10.4f} {ep:>6d}"
+        "{name:<46s} {acc:>8.4f} {bal:>8.4f} {mf1:>8.4f} "
+        "{mae:>8.4f} {mmae:>10.4f} {ep:>6d}"
     )
 
     lines = []
     lines.append(header_fmt.format(
         name="Experiment",
         acc="Acc",
-        bal="BalancedAcc",
+        bal="BalAcc",
         mf1="MacroF1",
-        wf1="WeightedF1",
+        mae="MAE",
+        mmae="MacroMAE",
         ep="Epoch",
     ))
     lines.append("-" * 100)
     for m in metrics_list:
         lines.append(row_fmt.format(
-            name=m.name[-48:],
+            name=m.name[-46:],
             acc=m.accuracy,
             bal=m.balanced_accuracy,
             mf1=m.macro_f1,
-            wf1=m.weighted_f1,
+            mae=m.mae,
+            mmae=m.macro_mae,
             ep=m.last_epoch,
         ))
     return "\n".join(lines)
 
 
 def format_per_class(metrics_list: List[ExperimentMetrics]) -> str:
-    """Format per-class recall/F1 details."""
+    """Format per-class recall/F1/MAE details."""
     lines = []
     for m in metrics_list:
         lines.append("")
         lines.append(f"== {m.name} ==")
-        lines.append(f"   videos={m.num_videos}  classes={m.num_classes}  epoch={m.last_epoch}")
-        lines.append(f"   {'class':<8s} {'prec':>8s} {'recall':>8s} {'f1':>8s} {'support':>10s}")
+        lines.append(
+            f"   videos={m.num_videos}  classes={m.num_classes}  epoch={m.last_epoch}"
+        )
+        lines.append(
+            f"   raw MAE={m.mae:.4f}  macro MAE={m.macro_mae:.4f}  "
+            f"(continuous: raw={m.mae_continuous:.4f}, macro={m.macro_mae_continuous:.4f})"
+        )
+        lines.append(
+            f"   {'class':<8s} {'prec':>8s} {'recall':>8s} {'f1':>8s} "
+            f"{'mae':>8s} {'support':>10s}"
+        )
         for c in range(m.num_classes):
             lines.append(
                 f"   {c:<8d} "
                 f"{m.per_class_precision[c]:>8.4f} "
                 f"{m.per_class_recall[c]:>8.4f} "
                 f"{m.per_class_f1[c]:>8.4f} "
+                f"{m.per_class_mae[c]:>8.4f} "
                 f"{m.per_class_support[c]:>10d}"
             )
         lines.append("   confusion matrix (rows=gt, cols=pred):")
@@ -309,13 +402,15 @@ def main() -> int:
             continue
 
         try:
-            y_true, y_pred, last_epoch = load_predictions(csv_path)
+            y_true, y_pred, y_pred_cont, last_epoch = load_predictions(csv_path)
         except Exception as exc:  # noqa: BLE001
             print(f"[FAIL] {exp_dir.name}: {exc}", file=sys.stderr)
             continue
 
         metrics_list.append(
-            compute_metrics(exp_dir.name, y_true, y_pred, last_epoch)
+            compute_metrics(
+                exp_dir.name, y_true, y_pred, y_pred_cont, last_epoch
+            )
         )
 
     if not metrics_list:
