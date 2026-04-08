@@ -1,0 +1,23 @@
+# BioVid 3-class data config for Siamese Stage 2.
+#
+# Label scheme (must match data/biovid/{train,test}_3class.txt):
+#   class 0 = {BLN, PA1, PA2}  (no or mild pain)
+#   class 1 = {PA3}            (moderate pain)
+#   class 2 = {PA4}            (severe pain)
+#
+# Siamese Stage 2 overrides go to runner_cfg.backbone_cfg (not model_cfg).
+# The Stage 1 OrdinalCLIP backbone is loaded frozen and SharedMLP + heads
+# are trained on top. num_ranks must match the Stage 1 checkpoint.
+data_cfg:
+  train_images_root: data/biovid
+  val_images_root:   data/biovid
+  test_images_root:  data/biovid
+  train_data_file: data/biovid/train_3class.txt
+  val_data_file:   data/biovid/test_3class.txt
+  test_data_file:  data/biovid/test_3class.txt
+
+runner_cfg:
+  backbone_cfg:
+    prompt_learner_cfg:
+      num_ranks: 3
+      init_rank_path: configs/base_cfgs/data_cfg/datasets/biovid/classnames_3class.txt
