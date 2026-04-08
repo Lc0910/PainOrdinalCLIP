@@ -120,20 +120,69 @@ def find_latest_version(experiment_dir: Path) -> Optional[Path]:
     return versions[-1] if versions else None
 
 
+def _iter_append_blocks(rows: List[dict]) -> Iterable[List[dict]]:
+    """Split CSV rows into append blocks.
+
+    Runner appends one full test block (one row per video) per test run.
+    Blocks are delimited by the (epoch, ckpt_path) pair changing between
+    consecutive rows, OR by a duplicate-header row reappearing in the
+    stream (which happens if the CSV was manually concatenated).
+
+    Each yielded block is a contiguous slice preserving file order.
+    """
+    if not rows:
+        return
+    block: List[dict] = []
+    last_key: Optional[tuple] = None
+    for row in rows:
+        # Handle re-inserted header rows: `epoch` column literally equal to
+        # the string "epoch". These break int parsing and always indicate a
+        # new block boundary.
+        if row.get("epoch") == "epoch":
+            if block:
+                yield block
+                block = []
+            last_key = None
+            continue
+
+        try:
+            key = (int(row["epoch"]), str(row.get("ckpt_path", "")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid epoch value in CSV row: {row!r}"
+            ) from exc
+
+        if last_key is not None and key != last_key:
+            yield block
+            block = []
+        block.append(row)
+        last_key = key
+
+    if block:
+        yield block
+
+
 def load_predictions(
     csv_path: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Load the latest-epoch predictions from a test_video_predictions.csv.
+    """Load the most recent test block from test_video_predictions.csv.
+
+    Runner writes the CSV in append mode (runner.py lines 205-216), so each
+    test run appends one full block of rows (one per video) with a fixed
+    (epoch, ckpt_path) key. This function identifies the final block by
+    scanning sequentially and slicing on (epoch, ckpt_path) changes.
 
     CSV schema: epoch, ckpt_path, video_id, gt, pred_exp, pred_max, n_frames
 
     Returns:
         y_true: [N] ground-truth labels (int).
-        y_pred: [N] predicted labels (rounded pred_max, int).
-        y_pred_continuous: [N] continuous predictions (pred_exp, float).
-            Used for MAE computation without rounding — better signal for
-            ordinal tasks than the discrete rounded version.
-        last_epoch: The epoch number of the predictions used.
+        y_pred_exp: [N] continuous expectation predictions (pred_exp, float).
+            This is Runner's "mae_exp" / "acc_exp" input.
+        y_pred_max: [N] continuous argmax-averaged predictions (pred_max,
+            float). This is Runner's "mae_max" / "acc_max" input. It is
+            NOT the rounded class label — rounding happens only for the
+            discrete classification metrics (acc / F1 / confusion).
+        last_epoch: The epoch of the final test block.
     """
     rows: List[dict] = []
     with open(csv_path, newline="") as f:
@@ -144,81 +193,169 @@ def load_predictions(
     if not rows:
         raise ValueError(f"No rows in {csv_path}")
 
-    # Keep only rows from the latest epoch (Runner appends all test runs).
-    last_epoch = max(int(r["epoch"]) for r in rows)
-    latest = [r for r in rows if int(r["epoch"]) == last_epoch]
+    blocks = list(_iter_append_blocks(rows))
+    if not blocks:
+        raise ValueError(f"No valid blocks in {csv_path}")
+
+    latest = blocks[-1]
+
+    # Sanity check: video_id should be unique within a single test block.
+    video_ids = [r["video_id"] for r in latest]
+    if len(set(video_ids)) != len(video_ids):
+        raise ValueError(
+            f"Duplicate video_id in latest block of {csv_path}: "
+            f"{len(video_ids)} rows but only {len(set(video_ids))} unique IDs"
+        )
+
+    last_epoch = int(latest[0]["epoch"])
 
     y_true = np.array([int(r["gt"]) for r in latest], dtype=np.int64)
-    y_pred = np.array(
-        [int(round(float(r["pred_max"]))) for r in latest],
-        dtype=np.int64,
+    y_pred_exp = np.array(
+        [float(r["pred_exp"]) for r in latest], dtype=np.float64
     )
-    y_pred_continuous = np.array(
-        [float(r["pred_exp"]) for r in latest],
-        dtype=np.float64,
+    y_pred_max = np.array(
+        [float(r["pred_max"]) for r in latest], dtype=np.float64
     )
-    return y_true, y_pred, y_pred_continuous, last_epoch
+
+    # Fail loudly on NaN / inf instead of silently producing a NaN MAE.
+    if not np.all(np.isfinite(y_pred_exp)):
+        raise ValueError(
+            f"Non-finite values in pred_exp of {csv_path} "
+            f"(found {int((~np.isfinite(y_pred_exp)).sum())} bad values)"
+        )
+    if not np.all(np.isfinite(y_pred_max)):
+        raise ValueError(
+            f"Non-finite values in pred_max of {csv_path} "
+            f"(found {int((~np.isfinite(y_pred_max)).sum())} bad values)"
+        )
+
+    return y_true, y_pred_exp, y_pred_max, last_epoch
 
 
-def _compute_per_class_mae(
+def _per_class_float_mae(
     y_true: np.ndarray,
-    y_pred: np.ndarray,
-    num_classes: int,
+    y_pred_float: np.ndarray,
+    labels: List[int],
 ) -> List[float]:
-    """MAE computed separately per ground-truth class.
+    """MAE computed separately per ground-truth class using float predictions.
 
-    Returns one MAE value per class. If a class has zero samples its MAE
-    is reported as NaN.
+    Matches Runner's video-level `mae_*_metric` definition: MAE is computed
+    directly on continuous pred_exp / pred_max floats, without rounding.
+
+    Returns one MAE value per class in `labels` order. If a class has zero
+    ground-truth samples its MAE is NaN.
     """
     per_class: List[float] = []
-    for c in range(num_classes):
+    for c in labels:
         mask = y_true == c
         if mask.sum() == 0:
             per_class.append(float("nan"))
         else:
-            per_class.append(float(np.mean(np.abs(y_pred[mask] - y_true[mask]))))
+            per_class.append(
+                float(np.mean(np.abs(y_pred_float[mask] - float(c))))
+            )
     return per_class
 
 
 def compute_metrics(
     name: str,
     y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_pred_continuous: np.ndarray,
+    y_pred_exp: np.ndarray,
+    y_pred_max: np.ndarray,
     last_epoch: int,
+    num_classes: Optional[int] = None,
 ) -> ExperimentMetrics:
-    num_classes = int(max(y_true.max(), y_pred.max())) + 1
+    """Compute all metrics for one experiment.
 
-    # Clip predictions into the valid label range (rounded pred_max may be
-    # out of range, especially when the model has not converged).
-    y_pred_clipped = np.clip(y_pred, 0, num_classes - 1)
-    y_pred_cont_clipped = np.clip(y_pred_continuous, 0.0, float(num_classes - 1))
+    Args:
+        name: Experiment identifier (directory name).
+        y_true: [N] ground-truth labels (int).
+        y_pred_exp: [N] continuous expectation predictions (float, Runner's
+            pred_exp after video-level averaging). Used for mae_continuous.
+        y_pred_max: [N] continuous argmax-averaged predictions (float,
+            Runner's pred_max). Used for the raw MAE that matches Runner.
+        last_epoch: Epoch of the predictions being evaluated.
+        num_classes: Optional explicit number of classes. If None, inferred
+            from `max(y_true, ceil(y_pred_max)) + 1` but ONLY for label
+            enumeration purposes — predictions are never clipped.
 
-    overall_acc = accuracy_score(y_true, y_pred_clipped)
-    balanced_acc = balanced_accuracy_score(y_true, y_pred_clipped)
-    macro_f1 = f1_score(y_true, y_pred_clipped, average="macro", zero_division=0)
-    weighted_f1 = f1_score(y_true, y_pred_clipped, average="weighted", zero_division=0)
+    Metric definitions:
+        - `mae` / `mae_continuous`: match Runner's `mae_max_metric` /
+          `mae_exp_metric` exactly — float-based, no rounding, no clipping.
+        - `macro_mae` / `macro_mae_continuous`: the balanced-subsample
+          equivalent. Average of per-class float MAE.
+        - `accuracy` / `balanced_accuracy` / `macro_f1`: use the discrete
+          prediction obtained by rounding `y_pred_max`. This matches
+          Runner's `acc_max_metric`.
+        - Per-class metrics and the confusion matrix use the SAME label
+          enumeration as the summary metrics to keep row/col semantics
+          aligned.
+    """
+    # Fail loudly on empty input.
+    if len(y_true) == 0:
+        raise ValueError(f"{name}: empty predictions")
 
-    # MAE (discrete, argmax prediction — matches Runner's "mae_max")
-    mae = float(np.mean(np.abs(y_pred_clipped - y_true)))
-    per_class_mae = _compute_per_class_mae(y_true, y_pred_clipped, num_classes)
-    valid_mae = [v for v in per_class_mae if not np.isnan(v)]
-    macro_mae = float(np.mean(valid_mae)) if valid_mae else float("nan")
+    # Discrete prediction for accuracy / F1 / confusion.
+    # Use rint (round-half-to-even) on the float pred_max to reproduce
+    # Runner's `round(pred_max) == gt` accuracy definition.
+    y_pred_discrete = np.rint(y_pred_max).astype(np.int64)
 
-    # MAE (continuous, expectation — matches Runner's "mae_exp")
-    mae_cont = float(np.mean(np.abs(y_pred_cont_clipped - y_true)))
-    per_class_mae_cont = _compute_per_class_mae(
-        y_true, y_pred_cont_clipped, num_classes
+    # Determine the authoritative label set:
+    #   - Use caller's num_classes when provided.
+    #   - Otherwise fall back to gt label space plus any out-of-range
+    #     predictions, but surface a warning rather than silently masking.
+    max_gt = int(y_true.max())
+    min_gt = int(y_true.min())
+    max_pred = int(np.ceil(y_pred_max.max()))
+    min_pred = int(np.floor(y_pred_max.min()))
+
+    if num_classes is None:
+        inferred_k = max(max_gt, max_pred) + 1
+        if min_pred < 0 or max_pred > max_gt:
+            print(
+                f"[WARN] {name}: predictions span [{min_pred}, {max_pred}] "
+                f"while ground-truth spans [{min_gt}, {max_gt}]. "
+                f"Extending label set to {inferred_k} classes. "
+                f"MAE is still computed from float predictions (no clipping).",
+                file=sys.stderr,
+            )
+        num_classes = inferred_k
+
+    labels = list(range(num_classes))
+
+    # Discrete classification metrics — pass explicit labels everywhere so
+    # summary and per-class views agree.
+    overall_acc = accuracy_score(y_true, y_pred_discrete)
+    balanced_acc = balanced_accuracy_score(y_true, y_pred_discrete)
+    macro_f1 = f1_score(
+        y_true, y_pred_discrete, labels=labels, average="macro", zero_division=0
     )
-    valid_mae_cont = [v for v in per_class_mae_cont if not np.isnan(v)]
-    macro_mae_cont = (
-        float(np.mean(valid_mae_cont)) if valid_mae_cont else float("nan")
+    weighted_f1 = f1_score(
+        y_true, y_pred_discrete, labels=labels, average="weighted", zero_division=0
     )
 
     precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred_clipped, labels=list(range(num_classes)), zero_division=0
+        y_true, y_pred_discrete, labels=labels, zero_division=0
     )
-    cm = confusion_matrix(y_true, y_pred_clipped, labels=list(range(num_classes)))
+    cm = confusion_matrix(y_true, y_pred_discrete, labels=labels)
+
+    # MAE metrics — use raw float predictions, no rounding, no clipping.
+    # These match Runner's video-level mae_max_metric / mae_exp_metric.
+    mae = float(np.mean(np.abs(y_pred_max - y_true)))
+    mae_cont = float(np.mean(np.abs(y_pred_exp - y_true)))
+
+    per_class_mae = _per_class_float_mae(y_true, y_pred_max, labels)
+    per_class_mae_cont = _per_class_float_mae(y_true, y_pred_exp, labels)
+
+    # Macro MAE: mean over classes that have at least one ground-truth
+    # sample. Empty classes are skipped (documented below) rather than
+    # silently zeroed.
+    valid_mae = [v for v in per_class_mae if not np.isnan(v)]
+    valid_mae_cont = [v for v in per_class_mae_cont if not np.isnan(v)]
+    if not valid_mae or not valid_mae_cont:
+        raise ValueError(f"{name}: no ground-truth samples in any class")
+    macro_mae = float(np.mean(valid_mae))
+    macro_mae_cont = float(np.mean(valid_mae_cont))
 
     return ExperimentMetrics(
         name=name,
@@ -298,13 +435,17 @@ def format_table(metrics_list: List[ExperimentMetrics]) -> str:
     ))
     lines.append("-" * 100)
     for m in metrics_list:
+        # macro_mae can be NaN if all classes are empty, but compute_metrics
+        # already raises in that case, so this is defensive only.
+        mae_val = m.mae if np.isfinite(m.mae) else float("nan")
+        mmae_val = m.macro_mae if np.isfinite(m.macro_mae) else float("nan")
         lines.append(row_fmt.format(
             name=m.name[-46:],
             acc=m.accuracy,
             bal=m.balanced_accuracy,
             mf1=m.macro_f1,
-            mae=m.mae,
-            mmae=m.macro_mae,
+            mae=mae_val,
+            mmae=mmae_val,
             ep=m.last_epoch,
         ))
     return "\n".join(lines)
@@ -328,12 +469,14 @@ def format_per_class(metrics_list: List[ExperimentMetrics]) -> str:
             f"{'mae':>8s} {'support':>10s}"
         )
         for c in range(m.num_classes):
+            mae_c = m.per_class_mae[c]
+            mae_str = f"{mae_c:>8.4f}" if np.isfinite(mae_c) else f"{'n/a':>8s}"
             lines.append(
                 f"   {c:<8d} "
                 f"{m.per_class_precision[c]:>8.4f} "
                 f"{m.per_class_recall[c]:>8.4f} "
                 f"{m.per_class_f1[c]:>8.4f} "
-                f"{m.per_class_mae[c]:>8.4f} "
+                f"{mae_str} "
                 f"{m.per_class_support[c]:>10d}"
             )
         lines.append("   confusion matrix (rows=gt, cols=pred):")
@@ -374,6 +517,17 @@ def main() -> int:
         action="store_true",
         help="Silently skip experiments without predictions CSV",
     )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=None,
+        help=(
+            "Explicit number of classes for the label space. If omitted, "
+            "the script infers it from ground-truth and prediction bounds "
+            "and prints a warning when predictions fall outside the gt "
+            "range. Predictions are never clipped."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.results_dir.is_dir():
@@ -402,16 +556,25 @@ def main() -> int:
             continue
 
         try:
-            y_true, y_pred, y_pred_cont, last_epoch = load_predictions(csv_path)
+            y_true, y_pred_exp, y_pred_max, last_epoch = load_predictions(csv_path)
         except Exception as exc:  # noqa: BLE001
             print(f"[FAIL] {exp_dir.name}: {exc}", file=sys.stderr)
             continue
 
-        metrics_list.append(
-            compute_metrics(
-                exp_dir.name, y_true, y_pred, y_pred_cont, last_epoch
+        try:
+            metrics_list.append(
+                compute_metrics(
+                    exp_dir.name,
+                    y_true,
+                    y_pred_exp,
+                    y_pred_max,
+                    last_epoch,
+                    num_classes=args.num_classes,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[FAIL] {exp_dir.name}: {exc}", file=sys.stderr)
+            continue
 
     if not metrics_list:
         print("No experiments with valid predictions found.", file=sys.stderr)
