@@ -36,6 +36,8 @@ class Runner(pl.LightningModule):
         ordinal_soft_label: bool = False,
         ordinal_soft_label_sigma: float = 1.0,
         class_weights: Optional[List[float]] = None,
+        video_agg_strategy: str = "mean",
+        video_agg_topk: int = 5,
     ) -> None:
         super().__init__()
         self.module = MODELS.build(model_cfg)
@@ -53,6 +55,14 @@ class Runner(pl.LightningModule):
         self.register_buffer("rank_output_value_array", torch.arange(0, self.num_ranks).float(), persistent=False)
         self.output_dir = Path(output_dir)
         self._custom_logger = get_logger(__name__)
+
+        # Video-level aggregation strategy: "mean" | "max" | "topk_mean"
+        assert video_agg_strategy in ("mean", "max", "topk_mean"), (
+            f"Unknown video_agg_strategy: {video_agg_strategy}. "
+            "Choose from: mean, max, topk_mean"
+        )
+        self.video_agg_strategy = video_agg_strategy
+        self.video_agg_topk = video_agg_topk
 
         self.load_weights(**load_weights_cfg)
         self._optimizer_and_scheduler_cfg = optimizer_and_scheduler_cfg
@@ -129,11 +139,39 @@ class Runner(pl.LightningModule):
         # --- Video-level aggregation ---
         self._video_level_aggregation(outputs, run_type)
 
+    @staticmethod
+    def _aggregate_values(values: list, strategy: str, topk: int) -> float:
+        """Aggregate a list of per-frame scalar predictions into one video-level value.
+
+        Args:
+            values: list of float, one per frame
+            strategy: "mean" | "max" | "topk_mean"
+            topk: number of top frames to average when strategy="topk_mean"
+
+        Returns:
+            float: aggregated video-level prediction
+        """
+        if strategy == "mean":
+            return sum(values) / len(values)
+        elif strategy == "max":
+            return max(values)
+        elif strategy == "topk_mean":
+            k = min(topk, len(values))
+            top_values = sorted(values, reverse=True)[:k]
+            return sum(top_values) / k
+        else:
+            raise ValueError(f"Unknown aggregation strategy: {strategy}")
+
     def _video_level_aggregation(self, outputs, run_type):
         """Aggregate frame predictions to video-level results.
 
         video_id is derived by stripping the trailing frame index:
         e.g. "images/071309_w_21-BL1-081_27.jpg" -> video_id "071309_w_21-BL1-081"
+
+        Aggregation strategy is controlled by self.video_agg_strategy:
+        - "mean": average all frame predictions (original behaviour)
+        - "max": take the maximum frame prediction (peak detection)
+        - "topk_mean": average the top-k highest frame predictions
         """
         all_paths = []
         all_targets = []
@@ -163,6 +201,9 @@ class Runner(pl.LightningModule):
             video_groups[video_id]["pred_exp"].append(all_pred_exp[i].item())
             video_groups[video_id]["pred_max"].append(all_pred_max[i].item())
 
+        strategy = self.video_agg_strategy
+        topk = self.video_agg_topk
+
         # Compute video-level metrics
         video_mae_exp, video_mae_max = [], []
         video_acc_exp, video_acc_max = [], []
@@ -171,8 +212,9 @@ class Runner(pl.LightningModule):
         for vid, data in video_groups.items():
             targets_sorted = sorted(data["targets"])
             gt = targets_sorted[len(targets_sorted) // 2]  # median gt
-            pred_exp = sum(data["pred_exp"]) / len(data["pred_exp"])  # mean pred
-            pred_max = sum(data["pred_max"]) / len(data["pred_max"])  # mean pred
+
+            pred_exp = self._aggregate_values(data["pred_exp"], strategy, topk)
+            pred_max = self._aggregate_values(data["pred_max"], strategy, topk)
 
             video_mae_exp.append(abs(pred_exp - gt))
             video_mae_max.append(abs(pred_max - gt))
@@ -189,6 +231,8 @@ class Runner(pl.LightningModule):
 
         n_videos = len(video_groups)
         video_stats = {
+            "video_agg_strategy": strategy,
+            "video_agg_topk": topk if strategy == "topk_mean" else None,
             "mae_exp_metric": sum(video_mae_exp) / n_videos,
             "mae_max_metric": sum(video_mae_max) / n_videos,
             "acc_exp_metric": sum(video_acc_exp) / n_videos,
@@ -215,8 +259,9 @@ class Runner(pl.LightningModule):
                 row["ckpt_path"] = str(self.ckpt_path)
             writer.writerows(video_predictions)
 
+        topk_suffix = f"(k={topk})" if strategy == "topk_mean" else ""
         logger.info(
-            f"[{run_type}] video-level: {n_videos} videos, "
+            f"[{run_type}] video-level ({strategy}{topk_suffix}): {n_videos} videos, "
             f"mae_exp={video_stats['mae_exp_metric']:.4f}, mae_max={video_stats['mae_max_metric']:.4f}, "
             f"acc_exp={video_stats['acc_exp_metric']:.4f}, acc_max={video_stats['acc_max_metric']:.4f}"
         )

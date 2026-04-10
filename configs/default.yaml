@@ -45,6 +45,12 @@ runner_cfg:
     kl_loss: 1.0
   ordinal_soft_label: false
   ordinal_soft_label_sigma: 1.0
+  # Video-level aggregation strategy for test/val:
+  #   "mean"      — average all frame predictions (default, original behaviour)
+  #   "max"       — take max frame prediction (peak detection / MIL)
+  #   "topk_mean" — average top-k highest frame predictions
+  video_agg_strategy: mean
+  video_agg_topk: 5
   model_cfg:
     type: OrdinalCLIP
     prompt_learner_cfg:

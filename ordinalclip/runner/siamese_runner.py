@@ -35,6 +35,29 @@ from ordinalclip.utils.logging import get_logger
 
 from .optim import build_lr_scheduler, build_optimizer
 
+
+def _aggregate_values(values: list, strategy: str, topk: int) -> float:
+    """Aggregate a list of per-frame scalar predictions into one video-level value.
+
+    Args:
+        values: list of float, one per frame
+        strategy: "mean" | "max" | "topk_mean"
+        topk: number of top frames to average when strategy="topk_mean"
+
+    Returns:
+        float: aggregated video-level prediction
+    """
+    if strategy == "mean":
+        return sum(values) / len(values)
+    elif strategy == "max":
+        return max(values)
+    elif strategy == "topk_mean":
+        k = min(topk, len(values))
+        top_values = sorted(values, reverse=True)[:k]
+        return sum(top_values) / k
+    else:
+        raise ValueError(f"Unknown aggregation strategy: {strategy}")
+
 logger = get_logger(__name__)
 
 
@@ -59,8 +82,18 @@ class SiameseRunner(pl.LightningModule):
         ckpt_path: str = "",
         anchor_inference_cfg: Optional[Dict] = None,
         au_cfg: Optional[Dict] = None,
+        video_agg_strategy: str = "mean",
+        video_agg_topk: int = 5,
     ) -> None:
         super().__init__()
+
+        # Video-level aggregation strategy: "mean" | "max" | "topk_mean"
+        assert video_agg_strategy in ("mean", "max", "topk_mean"), (
+            f"Unknown video_agg_strategy: {video_agg_strategy}. "
+            "Choose from: mean, max, topk_mean"
+        )
+        self.video_agg_strategy = video_agg_strategy
+        self.video_agg_topk = video_agg_topk
 
         if loss_weights is None:
             loss_weights = {
@@ -411,13 +444,17 @@ class SiameseRunner(pl.LightningModule):
         video_mae_ens, video_acc_ens = [], []
         video_predictions = []
 
+        strategy = self.video_agg_strategy
+        topk = self.video_agg_topk
+        agg = _aggregate_values  # shorthand
+
         for vid, data in video_groups.items():
             targets_sorted = sorted(data["targets"])
             gt = targets_sorted[len(targets_sorted) // 2]  # median gt
 
-            pred_reg = sum(data["pred_reg"]) / len(data["pred_reg"])
-            pred_exp = sum(data["pred_exp"]) / len(data["pred_exp"])
-            pred_max = sum(data["pred_max"]) / len(data["pred_max"])
+            pred_reg = agg(data["pred_reg"], strategy, topk)
+            pred_exp = agg(data["pred_exp"], strategy, topk)
+            pred_max = agg(data["pred_max"], strategy, topk)
 
             video_mae_reg.append(abs(pred_reg - gt))
             video_acc_reg.append(1.0 if round(pred_reg) == gt else 0.0)
@@ -436,12 +473,12 @@ class SiameseRunner(pl.LightningModule):
             }
 
             if has_rank:
-                pred_rank = sum(data["pred_rank"]) / len(data["pred_rank"])
+                pred_rank = agg(data["pred_rank"], strategy, topk)
                 video_mae_rank.append(abs(pred_rank - gt))
                 video_acc_rank.append(1.0 if round(pred_rank) == gt else 0.0)
                 row["pred_rank"] = round(pred_rank, 4)
             if has_ens:
-                pred_ens = sum(data["pred_ens"]) / len(data["pred_ens"])
+                pred_ens = agg(data["pred_ens"], strategy, topk)
                 video_mae_ens.append(abs(pred_ens - gt))
                 video_acc_ens.append(1.0 if round(pred_ens) == gt else 0.0)
                 row["pred_ens"] = round(pred_ens, 4)
@@ -450,6 +487,8 @@ class SiameseRunner(pl.LightningModule):
 
         n_videos = len(video_groups)
         video_stats = {
+            "video_agg_strategy": strategy,
+            "video_agg_topk": topk if strategy == "topk_mean" else None,
             # Primary: regression head
             "mae_reg_metric":  sum(video_mae_reg) / n_videos,
             "acc_reg_metric":  sum(video_acc_reg) / n_videos,
@@ -490,8 +529,9 @@ class SiameseRunner(pl.LightningModule):
                 row["ckpt_path"] = str(self.ckpt_path)
             writer.writerows(video_predictions)
 
+        topk_suffix = f"(k={topk})" if strategy == "topk_mean" else ""
         log_msg = (
-            f"[{run_type}] video-level: {n_videos} videos | "
+            f"[{run_type}] video-level ({strategy}{topk_suffix}): {n_videos} videos | "
             f"reg: mae={video_stats['mae_reg_metric']:.4f} acc={video_stats['acc_reg_metric']:.4f} | "
             f"exp: mae={video_stats['mae_exp_metric']:.4f} acc={video_stats['acc_exp_metric']:.4f}"
         )
