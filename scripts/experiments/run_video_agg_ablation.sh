@@ -40,11 +40,6 @@ if [[ -z "${EXPERIMENTS}" ]]; then
         expr_dir="$(dirname "$cfg")"
         # Must have a ckpts/ directory with at least one .ckpt file
         if ls "${expr_dir}"/ckpts/*.ckpt 1>/dev/null 2>&1; then
-            # Skip Siamese experiments — they use siamese_run.py, not run.py
-            if [[ "${expr_dir}" == *siamese* ]]; then
-                echo "[SKIP] ${expr_dir} (Siamese — needs siamese_run.py)"
-                continue
-            fi
             EXPR_DIRS+=("${expr_dir}")
         fi
     done < <(find results/ -name "config.yaml" -path "*/version_*" 2>/dev/null | sort)
@@ -103,17 +98,24 @@ for expr_dir in "${EXPR_DIRS[@]}"; do
         cfg_opts=$(strategy_to_cfg "${strategy}")
         TOTAL=$((TOTAL + 1))
 
+        # Auto-detect entry script: Siamese experiments use run_siamese.py
+        if [[ "${expr_dir}" == *siamese* ]]; then
+            RUN_SCRIPT="scripts/run_siamese.py"
+        else
+            RUN_SCRIPT="scripts/run.py"
+        fi
+
         if ${DRY_RUN}; then
-            echo "[DRY] python scripts/run.py --config ${expr_dir}/config.yaml --test_only --output_dir ${out_dir} --cfg_options ${cfg_opts}"
+            echo "[DRY] python ${RUN_SCRIPT} --config ${expr_dir}/config.yaml --test_only --output_dir ${out_dir} --cfg_options ${cfg_opts}"
             continue
         fi
 
         echo ""
         echo "========================================================"
-        echo "[${TOTAL}] ${expr_name} | strategy=${strategy}"
+        echo "[${TOTAL}] ${expr_name} | strategy=${strategy} | ${RUN_SCRIPT}"
         echo "========================================================"
 
-        if python scripts/run.py \
+        if python "${RUN_SCRIPT}" \
             --config "${expr_dir}/config.yaml" \
             --test_only \
             --output_dir "${out_dir}" \
