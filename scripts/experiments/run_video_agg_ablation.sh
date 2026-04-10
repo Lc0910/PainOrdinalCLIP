@@ -40,6 +40,11 @@ if [[ -z "${EXPERIMENTS}" ]]; then
         expr_dir="$(dirname "$cfg")"
         # Must have a ckpts/ directory with at least one .ckpt file
         if ls "${expr_dir}"/ckpts/*.ckpt 1>/dev/null 2>&1; then
+            # Skip Siamese experiments — they use siamese_run.py, not run.py
+            if [[ "${expr_dir}" == *siamese* ]]; then
+                echo "[SKIP] ${expr_dir} (Siamese — needs siamese_run.py)"
+                continue
+            fi
             EXPR_DIRS+=("${expr_dir}")
         fi
     done < <(find results/ -name "config.yaml" -path "*/version_*" 2>/dev/null | sort)
