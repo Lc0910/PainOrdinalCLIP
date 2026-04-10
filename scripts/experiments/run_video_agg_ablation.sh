@@ -105,8 +105,23 @@ for expr_dir in "${EXPR_DIRS[@]}"; do
             RUN_SCRIPT="scripts/run.py"
         fi
 
+        # For Siamese: find best ckpt from ORIGINAL dir and pass via ckpt_path
+        # (run_siamese.py test_only needs explicit ckpt_path, not auto-scan of output_dir)
+        CKPT_OPT=""
+        if [[ "${RUN_SCRIPT}" == *siamese* ]]; then
+            best_ckpt=$(ls -t "${expr_dir}"/ckpts/*.ckpt 2>/dev/null | grep -v "last" | head -1)
+            if [[ -z "${best_ckpt}" ]]; then
+                best_ckpt=$(ls -t "${expr_dir}"/ckpts/*.ckpt 2>/dev/null | head -1)
+            fi
+            if [[ -z "${best_ckpt}" ]]; then
+                echo "[SKIP] ${expr_name} | ${strategy} (no checkpoint found)"
+                continue
+            fi
+            CKPT_OPT="runner_cfg.ckpt_path=${best_ckpt}"
+        fi
+
         if ${DRY_RUN}; then
-            echo "[DRY] python ${RUN_SCRIPT} --config ${expr_dir}/config.yaml --test_only --output_dir ${out_dir} --cfg_options ${cfg_opts}"
+            echo "[DRY] python ${RUN_SCRIPT} --config ${expr_dir}/config.yaml --test_only --output_dir ${out_dir} --cfg_options ${cfg_opts} ${CKPT_OPT}"
             continue
         fi
 
@@ -119,7 +134,7 @@ for expr_dir in "${EXPR_DIRS[@]}"; do
             --config "${expr_dir}/config.yaml" \
             --test_only \
             --output_dir "${out_dir}" \
-            --cfg_options ${cfg_opts}; then
+            --cfg_options ${cfg_opts} ${CKPT_OPT}; then
             SUCCESS=$((SUCCESS + 1))
             echo "[OK] ${expr_name} | ${strategy}"
         else
